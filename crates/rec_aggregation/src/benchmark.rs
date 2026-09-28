@@ -7,8 +7,16 @@ use primitives::{pretty_f64, pretty_integer};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use xmss::{XmssPublicKey, XmssSignature};
 
-use crate::aggregation::{DaInput, EthereumProof, aggregate, aggregate_with_stats};
+use crate::aggregation::{DaInput, EthereumProof, Payee, aggregate, aggregate_with_stats};
 use crate::signers_cache;
+
+/// Who proves the benchmarked node; each recursion leaf has its own, so the node's
+/// payee table holds all of them.
+const PAYEE_NODE: Payee = [0xee; 20];
+
+fn leaf_payee(k: usize) -> Payee {
+    [k as u8 + 1; 20]
+}
 
 fn blobs(n: usize, seed: u64) -> Vec<u64> {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -112,6 +120,7 @@ pub fn run_aggregation(n_xmss: usize, n_sphincs: usize, n_blobs: usize, log_inv_
                 rows: &blobs,
                 roots: None,
             },
+            PAYEE_NODE,
             log_inv_rate,
         )
         .expect("leaf aggregates")
@@ -195,6 +204,7 @@ pub fn run_recursion(
                 all_sphincs[k * sphincs_per_leaf..(k + 1) * sphincs_per_leaf].to_vec(),
                 &blobs(blobs_per_leaf, k as u64),
                 None,
+                leaf_payee(k),
                 log_inv_rate,
             )
             .expect("leaf aggregates")
@@ -206,8 +216,16 @@ pub fn run_recursion(
     }
     let ((sig, stats), prove_time) = plan.warm_then_measure(|last| {
         let _quiet = (!last).then(primitives::suppress_tracing);
-        aggregate_with_stats(&children, vec![], vec![], None, DaInput::default(), log_inv_rate)
-            .expect("node aggregates")
+        aggregate_with_stats(
+            &children,
+            vec![],
+            vec![],
+            None,
+            DaInput::default(),
+            PAYEE_NODE,
+            log_inv_rate,
+        )
+        .expect("node aggregates")
     });
     let (_, verify_time) = Plan::new(plan.repeat, 0).measure_quiet(|last| {
         let _quiet = (!last).then(primitives::suppress_tracing);

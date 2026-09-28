@@ -28,6 +28,12 @@
 //! key's two cells and a SPHINCS slot four, its key and its message, so the
 //! guest reads each SPHINCS signature's message out of the slot it verifies.
 //!
+//! A SPHINCS slot also carries a credit: the index, in the node's payee table,
+//! of whoever verified that claim's signature raw. A raw signature credits the
+//! node's own payee, entry 0; a child's claim keeps its child's credit, through a
+//! hinted map the guest checks address by address. The credit digest rides the
+//! statement beside the signer-set digest, which stays a function of the claims.
+//!
 //! The bytecode is compiled to a fixed point on its own size
 //! ([`unified_guest`]): the recursion placeholders depend on the inner bytecode
 //! size, and here the inner bytecode is this one. Its digest does not need a
@@ -63,6 +69,10 @@ use sphincs::{SphincsPublicKey, SphincsSignature};
 /// One SPHINCS claim: a key, and the message it signed. Where an XMSS group
 /// shares one message, every SPHINCS signer carries its own.
 pub type SphincsClaim = (SphincsPublicKey, sphincs::Message);
+
+/// Who gets credit for verifying a SPHINCS claim raw: a 20-byte (execution-layer)
+/// address, chosen by whoever proves the node that verified it.
+pub type Payee = [u8; 20];
 
 /// The XMSS signers sharing one epoch: the epoch, the message they all signed
 /// at it, and their strictly sorted keys.
@@ -100,6 +110,15 @@ const _: () = assert!(MAX_DA_ROOTS < MAX_KEYS);
 /// expected in practice. An empty group is in-circuit unprovable, its list hash
 /// having no valid window split, so this is a bound on cost, not on soundness.
 pub const MAX_EPOCHS: usize = 1024;
+
+/// The most entries one payee table can hold: the node's own payee, then the ones
+/// its declared SPHINCS claims credit. A bound on cost: a node keeps only the payees
+/// its declared claims name, so this caps distinct payees per aggregate.
+pub const MAX_PAYEES: usize = 1 << 12;
+// The guest bounds the table's length by a range check, which takes at most 2^16,
+// and hashes its two cells a payee with a byte counter decomposed into
+// SIGNERS_COUNT_BITS bits.
+const _: () = assert!(MAX_PAYEES < 1 << 16 && 2 * MAX_PAYEES < 1 << 16);
 
 /// Blocks the guest absorbs per loop frame when it hashes a declared list, and so
 /// how many share one byte-counter base (`doc/leanvm` §Byte counters for a hash of
@@ -241,6 +260,41 @@ fn sphincs_list_digest(signers: &[SphincsClaim]) -> [F192; 2] {
     pack_hash_state(&primitives::hash::hash(&cell_bytes(cells)))
 }
 
+/// A payee as the two cells the guest hashes and compares: the address, zero-padded
+/// to 32 bytes.
+fn payee_cells(payee: &Payee) -> [F192; 2] {
+    let mut bytes = [0u8; 32];
+    bytes[..20].copy_from_slice(payee);
+    pack_hash_state(&bytes)
+}
+
+/// Plain BLAKE2s of a run of cells, 16 bytes each (`cell_run_digest` in the guest).
+fn cell_run_digest(cells: impl IntoIterator<Item = F192>) -> [F192; 2] {
+    pack_hash_state(&primitives::hash::hash(&cell_bytes(cells)))
+}
+
+/// How the guest splits a non-empty run of `n` cells: `q` whole blocks, as windows
+/// plus a tail, then a last block of `l` cells, `n = 4q + l` with `l` in `1..=4`.
+fn cell_run_split(n: usize) -> Vec<F192> {
+    assert!(n > 0, "an empty run has no split");
+    let whole = (n - 1) / 4;
+    vec![
+        count(whole / SIGNERS_WINDOW),
+        count(whole % SIGNERS_WINDOW),
+        count((n - 1) % 4),
+    ]
+}
+
+/// The credit digest the statement carries: BLAKE2s of the credit list's digest
+/// then the payee table's, one block. The list is one cell a declared SPHINCS
+/// claim, `g^i` for the payee it credits; the table two cells a payee. Each list
+/// hash binds its own length.
+fn credit_digest(payees: &[Payee], credits: &[u16]) -> [F192; 2] {
+    let list = cell_run_digest(credits.iter().map(|&i| count(i.into())));
+    let table = cell_run_digest(payees.iter().flat_map(payee_cells));
+    cell_run_digest([list[0], list[1], table[0], table[1]])
+}
+
 /// A SPHINCS signer as the four cells the guest hashes and `verify_sig_sphincs`
 /// reads: the key, then the message that key signed.
 fn sphincs_signer_cells((pk, message): &SphincsClaim) -> [F192; 4] {
@@ -370,9 +424,10 @@ impl DeferredClaim {
 }
 
 /// The statement's fixed header, ahead of the deferred cells: the seed, the
-/// signer-set digest (which itself binds the epoch groups and every count), and
-/// the DA root-list digest. Fed to the guest as `STMT_HEADER`, so the two cannot drift.
-const STATEMENT_HEADER: usize = 6;
+/// signer-set digest (which itself binds the epoch groups and every count), the
+/// DA root-list digest, and the credit digest. Fed to the guest as `STMT_HEADER`,
+/// so the two cannot drift.
+const STATEMENT_HEADER: usize = 8;
 
 /// A plain BLAKE2s over a lane stream, zero-filled to a whole 64-byte block:
 /// what the guest gets by streaming four 128-bit cells a block.
@@ -394,7 +449,12 @@ fn lane_hash(lanes: impl Iterator<Item = u64>) -> [F192; 2] {
 /// BLAKE2s here. The header is hashed as the canonical cells it already is (two
 /// lanes each, whence the assert, the guest being unable to hash a third), then
 /// all three lanes of each deferred cell.
-fn statement_digest(signers_hash: [F192; 2], da_digest: [u8; 32], defer: &DeferredClaim) -> [F192; 2] {
+fn statement_digest(
+    signers_hash: [F192; 2],
+    da_digest: [u8; 32],
+    credit_digest: [F192; 2],
+    defer: &DeferredClaim,
+) -> [F192; 2] {
     let seed = lean_vm::cpu::fs_seed(unified_guest());
     let da_digest = pack_hash_state(&da_digest);
     let header = [
@@ -404,6 +464,8 @@ fn statement_digest(signers_hash: [F192; 2], da_digest: [u8; 32], defer: &Deferr
         signers_hash[1],
         da_digest[0],
         da_digest[1],
+        credit_digest[0],
+        credit_digest[1],
     ];
     assert_eq!(header.len(), STATEMENT_HEADER);
     let mut cells = defer.cells();
@@ -438,6 +500,8 @@ struct DeferredSubproof {
 /// [`Self::sphincs_signers`] is backed by a valid SPHINCS signature. Each root in
 /// [`Self::da_commitments`] also attests that the committed blob rows are valid Reed-Solomon codewords.
 /// These claims can be established directly or carried from verified child proofs.
+/// Each SPHINCS claim also names, in [`Self::sphincs_credits`], the payee of the
+/// node that verified its signature raw, carried unchanged through every fold.
 ///
 /// The two lists describe the signature claims and remain separate because the proof says which scheme
 /// verified which key (the module docs give the coverage argument). Until
@@ -458,6 +522,12 @@ pub struct EthereumProof {
     sphincs_signers: Vec<SphincsClaim>,
     /// Strictly sorted LeanDA roots. Their list digest rides the public statement.
     da_roots: Vec<[u8; 32]>,
+    /// Entry 0 is the payee of whoever proved this aggregate; the rest, strictly
+    /// sorted and distinct from it, are payees its children credited.
+    payees: Vec<Payee>,
+    /// One index into [`Self::payees`] per SPHINCS claim, aligned with
+    /// [`Self::sphincs_signers`]: who verified that claim raw.
+    sphincs_credits: Vec<u16>,
     /// What this aggregate defers to whoever discharges it: its parent, in
     /// circuit, or [`Self::verify`], natively.
     defer: DeferredClaim,
@@ -472,6 +542,9 @@ pub enum AggregateVerifyError {
     MalformedDaCommitments,
     /// A deferred claim's point has the wrong number of coordinates.
     MalformedClaim,
+    /// The payee table is empty, too long or not canonical, or the credit list is
+    /// not one index into it per SPHINCS claim.
+    MalformedCredits,
     /// The bytes are not a valid encoding of an aggregate.
     MalformedEncoding,
     /// The snark itself did not verify.
@@ -494,7 +567,8 @@ pub enum AggregationError {
     /// so there is no witness to build for it.
     MalformedRawSignature,
     /// More than [`MAX_RECURSIONS`] children, or [`MAX_KEYS`] signers or more
-    /// once the duplicate slots are counted, or more than [`MAX_DA_ROOTS`] DA roots.
+    /// once the duplicate slots are counted, or more than [`MAX_DA_ROOTS`] DA roots,
+    /// or more than [`MAX_PAYEES`] payees credited.
     TooLarge,
     /// The payload has a partial row or exceeds [`DA_MAX_ROWS`].
     InvalidBlobSize { symbols: usize },
@@ -518,6 +592,7 @@ impl std::fmt::Display for AggregateVerifyError {
             Self::MalformedSignerSet => write!(f, "malformed signer set"),
             Self::MalformedDaCommitments => write!(f, "malformed DA commitment list"),
             Self::MalformedClaim => write!(f, "malformed deferred claim"),
+            Self::MalformedCredits => write!(f, "malformed payee table or credit list"),
             Self::MalformedEncoding => write!(f, "not a valid aggregate encoding"),
             Self::Snark(e) => write!(f, "the snark did not verify: {e:?}"),
         }
@@ -535,7 +610,7 @@ impl std::fmt::Display for AggregationError {
             Self::NotCovered => write!(f, "a declared claim is not covered by the children and raw signatures"),
             Self::MalformedRawSignature => write!(f, "a raw signature does not decode to a target-sum encoding"),
             Self::TooLarge => {
-                write!(f, "too many children, signature claims, or DA roots")
+                write!(f, "too many children, signature claims, DA roots, or payees")
             }
             Self::InvalidBlobSize { symbols } => {
                 write!(
@@ -574,7 +649,14 @@ impl std::error::Error for AggregationError {
 }
 
 /// Everything but the signer set, which a receiver may already hold.
-type WireCore = (Vec<[u8; 32]>, Vec<F192>, Vec<F192>, lean_vm::cpu::Proof);
+type WireCore = (
+    Vec<Payee>,
+    Vec<u16>,
+    Vec<[u8; 32]>,
+    Vec<F192>,
+    Vec<F192>,
+    lean_vm::cpu::Proof,
+);
 
 /// Signature claims grouped by scheme: XMSS epoch/message groups, then SPHINCS key/message pairs.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -625,6 +707,26 @@ fn check_signer_set(
     Ok(())
 }
 
+/// Reject a payee table or credit list the statement could not have come from: at
+/// least the node's own payee, at most [`MAX_PAYEES`], the rest strictly sorted and
+/// none of them the node's own (the one encoding of each table), and one in-range
+/// index per SPHINCS claim. The guest leaves the range check of a credit to whoever
+/// reads the list, which at the root is this.
+fn check_credits(payees: &[Payee], credits: &[u16], n_sphincs: usize) -> Result<(), AggregateVerifyError> {
+    let Some((own, rest)) = payees.split_first() else {
+        return Err(AggregateVerifyError::MalformedCredits);
+    };
+    if payees.len() > MAX_PAYEES
+        || !rest.windows(2).all(|w| w[0] < w[1])
+        || rest.contains(own)
+        || credits.len() != n_sphincs
+        || credits.iter().any(|&i| usize::from(i) >= payees.len())
+    {
+        return Err(AggregateVerifyError::MalformedCredits);
+    }
+    Ok(())
+}
+
 fn check_da_roots(roots: &[[u8; 32]]) -> Result<(), AggregateVerifyError> {
     if roots.len() > MAX_DA_ROOTS || roots.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(AggregateVerifyError::MalformedDaCommitments);
@@ -650,8 +752,27 @@ impl EthereumProof {
         statement_digest(
             signers_hash(&self.xmss_signers, &self.sphincs_signers),
             self.da_commitments_digest(),
+            credit_digest(&self.payees, &self.sphincs_credits),
             &self.defer,
         )
+    }
+
+    /// Entry 0 is the payee of whoever proved this aggregate; the rest are payees
+    /// its children credited, strictly sorted.
+    pub fn payees(&self) -> &[Payee] {
+        &self.payees
+    }
+
+    /// One index into [`Self::payees`] per claim of [`Self::sphincs_signers`]: the
+    /// payee of the node that verified that claim's signature raw. Like the lists,
+    /// a claim until [`Self::verify`] returns `Ok`.
+    pub fn sphincs_credits(&self) -> &[u16] {
+        &self.sphincs_credits
+    }
+
+    /// The payee credited for [`Self::sphincs_signers`]`[i]`.
+    pub fn sphincs_payee(&self, i: usize) -> &Payee {
+        &self.payees[usize::from(self.sphincs_credits[i])]
     }
 
     /// Strictly increasing `(epoch, message)` pairs, each group non-empty and
@@ -689,7 +810,7 @@ impl EthereumProof {
     }
 
     /// The wire format: the signer set (each group with its epoch and
-    /// message), the DA root list, the two deferred points, and the VM proof. The claim *values* are not transmitted;
+    /// message), the payee table and credits, the DA root list, the two deferred points, and the VM proof. The claim *values* are not transmitted;
     /// [`Self::from_bytes`] recomputes them, so there is nothing to lie about.
     pub fn to_bytes(&self) -> Vec<u8> {
         wire()
@@ -726,8 +847,11 @@ impl EthereumProof {
         )
     }
 
-    fn core(&self) -> (&[[u8; 32]], &[F192], &[F192], &lean_vm::cpu::Proof) {
+    #[allow(clippy::type_complexity)]
+    fn core(&self) -> (&[Payee], &[u16], &[[u8; 32]], &[F192], &[F192], &lean_vm::cpu::Proof) {
         (
+            &self.payees,
+            &self.sphincs_credits,
             &self.da_roots,
             &self.defer.bytecode_point,
             &self.defer.matrix_point,
@@ -740,16 +864,19 @@ impl EthereumProof {
             xmss: xmss_signers,
             sphincs: sphincs_signers,
         } = keys;
-        let (da_roots, bytecode_point, matrix_point, proof) = core;
+        let (payees, sphincs_credits, da_roots, bytecode_point, matrix_point, proof) = core;
         // Cheap rejections first. `recompute` below is a pass over the whole stacked
         // bytecode plus a walk of the BLAKE2s circuit, on points a peer chose, so
         // anything decidable without it has to be decided before it.
         check_signer_set(&xmss_signers, &sphincs_signers)?;
+        check_credits(&payees, &sphincs_credits, sphincs_signers.len())?;
         check_da_roots(&da_roots)?;
         Ok(Self {
             xmss_signers,
             sphincs_signers,
             da_roots,
+            payees,
+            sphincs_credits,
             // The wire carries no value, only the points to derive it from.
             defer: DeferredClaim::recompute(bytecode_point, matrix_point)?,
             proof,
@@ -768,9 +895,12 @@ impl EthereumProof {
     /// epochs, or under different messages, verifies just as well. A caller that
     /// expects particular pairs has to check the two lists against them. Every root in
     /// [`Self::da_commitments`] also attests to a well-formed blob matrix; callers check
-    /// that this list contains the commitments they require.
+    /// that this list contains the commitments they require. Each SPHINCS claim's
+    /// credit names the node that verified its signature raw, as that node's prover
+    /// chose to name itself; no node on the way could move it to another payee.
     pub fn verify(&self) -> Result<(), AggregateVerifyError> {
         check_signer_set(&self.xmss_signers, &self.sphincs_signers)?;
+        check_credits(&self.payees, &self.sphincs_credits, self.sphincs_signers.len())?;
         check_da_roots(&self.da_roots)?;
         // Discharging the deferred claims IS recomputing them: their values have
         // to be the true evaluations, or the recursion below proves nothing about
@@ -1922,6 +2052,56 @@ fn plan_coverage(
     }
     Ok(cover)
 }
+/// Who is credited for each declared SPHINCS claim, and the payee table the credits
+/// index: the occurrence that takes a claim's declared slot, in the guest's walk
+/// order, is the one credited (a raw signature credits `payee`, a child's claim
+/// keeps its child's credit). The table is `payee`, then every other payee a
+/// declared claim credits, sorted: a child's payee that no declared claim names is
+/// dropped, its map entry 0.
+fn plan_credits(
+    cover: &Coverage,
+    children: &[EthereumProof],
+    payee: Payee,
+) -> Result<(Vec<Payee>, Vec<u16>), AggregationError> {
+    let n_sphincs = cover.sphincs_signers.len();
+    let mut credited: Vec<Option<Payee>> = vec![None; n_sphincs];
+    for &slot in &cover.raw_sphincs {
+        if slot < n_sphincs {
+            credited[slot] = Some(payee);
+        }
+    }
+    for (child, slots) in children.iter().zip(&cover.child_sphincs) {
+        for (&slot, &credit) in slots.iter().zip(&child.sphincs_credits) {
+            if slot < n_sphincs {
+                credited[slot] = Some(child.payees[usize::from(credit)]);
+            }
+        }
+    }
+    let credited: Vec<Payee> = credited
+        .into_iter()
+        .map(|p| p.expect("coverage writes every declared slot"))
+        .collect();
+    let others: BTreeSet<Payee> = credited.iter().filter(|p| **p != payee).copied().collect();
+    let payees: Vec<Payee> = std::iter::once(payee).chain(others).collect();
+    if payees.len() > MAX_PAYEES {
+        return Err(AggregationError::TooLarge);
+    }
+    let index: BTreeMap<Payee, u16> = payees.iter().enumerate().map(|(i, p)| (*p, i as u16)).collect();
+    Ok((payees, credited.iter().map(|p| index[p]).collect()))
+}
+
+/// A run of cells the guest hashes with `cell_run_digest`, hinted: its split, then
+/// its cells four to an entry. An empty run hashes without either.
+fn push_cell_run(hints: &mut Hints, cells: Vec<F192>) {
+    if cells.is_empty() {
+        return;
+    }
+    hints.push("credit_split", cell_run_split(cells.len()));
+    for chunk in cells.chunks(4) {
+        hints.push("credit_cells", chunk.to_vec());
+    }
+}
+
 /// One signature's witness: the WOTS randomness, the encoding digits (in the
 /// exponent), the chain tips they start from, and the Merkle siblings.
 fn push_signature_hints(
@@ -2011,6 +2191,8 @@ pub(crate) struct DaInput<'a> {
 ///   at most [`DA_MAX_ROWS`] blobs.
 /// - `declare`: `None` keeps all claims; `Some` specifies exactly the signatures and DA roots
 ///   to publish. Every declared claim must be covered by the inputs above.
+/// - `payee`: who gets credit for the SPHINCS signatures in `raw_sphincs`; a child's
+///   claim keeps its child's credit.
 /// - `log_inv_rate`: PCS code rate `2^-log_inv_rate`, higher `log_inv_rate` means a smaller proof
 ///   but slower proving; in [`MIN_LOG_INV_RATE`]..=[`MAX_LOG_INV_RATE`].
 ///
@@ -2028,6 +2210,7 @@ pub fn aggregate(
     raw_sphincs: Vec<(SphincsPublicKey, sphincs::Message, SphincsSignature)>,
     blobs: &[u64],
     declare: Option<ClaimSelection<'_>>,
+    payee: Payee,
     log_inv_rate: usize,
 ) -> Result<EthereumProof, AggregationError> {
     let da_input = DaInput {
@@ -2040,6 +2223,7 @@ pub fn aggregate(
         raw_sphincs,
         declare.map(|claims| claims.signatures),
         da_input,
+        payee,
         log_inv_rate,
     )
     .map(|(sig, _)| sig)
@@ -2052,9 +2236,19 @@ pub(crate) fn aggregate_with_stats(
     raw_sphincs: Vec<(SphincsPublicKey, sphincs::Message, SphincsSignature)>,
     declare: Option<&SignatureClaims>,
     da_input: DaInput<'_>,
+    payee: Payee,
     log_inv_rate: usize,
 ) -> Result<(EthereumProof, lean_vm::cpu::Stats), AggregationError> {
-    aggregate_tampered(children, raw_xmss, raw_sphincs, declare, da_input, log_inv_rate, |_| {})
+    aggregate_tampered(
+        children,
+        raw_xmss,
+        raw_sphincs,
+        declare,
+        da_input,
+        payee,
+        log_inv_rate,
+        |_, _, _| {},
+    )
 }
 
 /// [`aggregate`], with a hook to corrupt the witness before proving.
@@ -2062,15 +2256,18 @@ pub(crate) fn aggregate_with_stats(
 /// The coverage argument and the claim batching are enforced entirely by guest
 /// asserts over prover advice, so the only way to test them is to lie in a hint
 /// and require the guest to notice. That is what `tamper` is for
-/// (`aggregate_hints_bind`); with an empty hook this is the production path.
+/// (`aggregate_hints_bind`); with an empty hook this is the production path. It
+/// also gets the payee table and credits the statement will publish, since a lie
+/// about a credit only means something when the statement tells the same lie.
 pub(crate) fn aggregate_tampered(
     children: &[EthereumProof],
     raw_xmss: Vec<(XmssPublicKey, xmss::Epoch, xmss::Message, XmssSignature)>,
     raw_sphincs: Vec<(SphincsPublicKey, sphincs::Message, SphincsSignature)>,
     declare: Option<&SignatureClaims>,
     da_input: DaInput<'_>,
+    payee: Payee,
     log_inv_rate: usize,
-    tamper: impl FnOnce(&mut Hints),
+    tamper: impl FnOnce(&mut Hints, &mut Vec<Payee>, &mut Vec<u16>),
 ) -> Result<(EthereumProof, lean_vm::cpu::Stats), AggregationError> {
     // Otherwise this reaches `cpu::prove`, which asserts rather than reporting.
     if !(lean_vm::pcs::MIN_LOG_INV_RATE..=lean_vm::pcs::MAX_LOG_INV_RATE).contains(&log_inv_rate) {
@@ -2120,6 +2317,8 @@ pub(crate) fn aggregate_tampered(
     let _span = tracing::info_span!("Verify children").entered();
     for child in children {
         check_signer_set(&child.xmss_signers, &child.sphincs_signers).map_err(AggregationError::InvalidChild)?;
+        check_credits(&child.payees, &child.sphincs_credits, child.sphincs_signers.len())
+            .map_err(AggregationError::InvalidChild)?;
         let pi = child.public_input();
         let summary = verify(guest, &pi, &child.proof)
             .map_err(|e| AggregationError::InvalidChild(AggregateVerifyError::Snark(e)))?;
@@ -2141,6 +2340,8 @@ pub(crate) fn aggregate_tampered(
         return Err(AggregationError::TooLarge);
     }
     let n_sphincs = cover.sphincs_signers.len();
+    let (mut payees, mut sphincs_credits) = plan_credits(&cover, children, payee)?;
+    let payee_index: BTreeMap<Payee, usize> = payees.iter().enumerate().map(|(i, p)| (*p, i)).collect();
     let group_cells = |group: &XmssClaimGroup| {
         [
             F192::new(group.epoch as u64, 0, 0),
@@ -2164,6 +2365,8 @@ pub(crate) fn aggregate_tampered(
     );
     let fs_seed = lean_vm::cpu::fs_seed(guest);
     hints.push("fs_seed", vec![fs_seed[0], fs_seed[1]]);
+    hints.push("n_payees", vec![count(payees.len())]);
+    push_cell_run(&mut hints, payees.iter().flat_map(payee_cells).collect());
     // Per group: its epoch, its two message cells, and its declared, duplicate
     // and raw-signature counts, in the guest's geometry-pass order. The keys
     // then ride two per `pubkeys` entry, so the guest can halve its loop
@@ -2242,6 +2445,16 @@ pub(crate) fn aggregate_tampered(
                 hints.push("child_index", pair.iter().map(|&idx| count(idx)).collect());
             }
         }
+        hints.push("child_payees", vec![count(child.payees.len())]);
+        push_cell_run(&mut hints, child.payees.iter().flat_map(payee_cells).collect());
+        for p in &child.payees {
+            // A payee none of this node's declared claims credit is dropped: 0.
+            hints.push("credit_map", vec![payee_index.get(p).map_or(F192::ZERO, |&k| count(k))]);
+        }
+        push_cell_run(
+            &mut hints,
+            child.sphincs_credits.iter().map(|&k| count(k.into())).collect(),
+        );
         if !cover.child_sphincs[i].is_empty() {
             hints.push("signers_split", signers_split(cover.child_sphincs[i].len()));
         }
@@ -2260,6 +2473,10 @@ pub(crate) fn aggregate_tampered(
     }
 
     drop(_span);
+    // The node's own credit list, hashed last and from memory: no cells, only its split.
+    if n_sphincs > 0 {
+        hints.push("credit_split", cell_run_split(n_sphincs));
+    }
 
     let defer = if children.is_empty() {
         let leaf = DeferredClaim::leaf();
@@ -2338,9 +2555,11 @@ pub(crate) fn aggregate_tampered(
         hints.push("da_roots", da_claim_cells(root));
     }
 
+    tamper(&mut hints, &mut payees, &mut sphincs_credits);
     let public_input = statement_digest(
         signers_hash(cover.declared(), &cover.sphincs_signers),
         da_list_digest(&da_roots),
+        credit_digest(&payees, &sphincs_credits),
         &defer,
     );
     let mut program = guest.clone();
@@ -2348,7 +2567,6 @@ pub(crate) fn aggregate_tampered(
     // `2^MU_MIN`. A run smaller than that (a leaf of a few dozen signatures) grows
     // its SET table until it clears the floor.
     program.min_log_committed = MU_MIN;
-    tamper(&mut hints);
     hints.install(&mut program);
     let (proof, stats) = prove(&program, public_input, log_inv_rate).map_err(AggregationError::ProofError)?;
     Ok((
@@ -2356,6 +2574,8 @@ pub(crate) fn aggregate_tampered(
             xmss_signers: cover.declared().to_vec(),
             sphincs_signers: cover.sphincs_signers,
             da_roots,
+            payees,
+            sphincs_credits,
             defer,
             proof,
         },
@@ -2979,6 +3199,7 @@ fn placeholder_map(kbc: usize) -> BTreeMap<String, String> {
     ps("DA_ROOT_COUNTS", (MAX_DA_ROOTS + 1).to_string());
     ps("MAX_RECURSIONS", MAX_RECURSIONS.to_string());
     ps("MAX_EPOCHS", MAX_EPOCHS.to_string());
+    ps("MAX_PAYEES", MAX_PAYEES.to_string());
 
     // The SPHINCS instance. Its tweaks are derived per signature from the index
     // the message digest picks, where XMSS's come from one public epoch, so the
@@ -3085,6 +3306,8 @@ mod tests {
 
     const SMALL_LEAF_SIZE: usize = 6;
     const LOG_INV_RATE: usize = lean_vm::pcs::TEST_LOG_INV_RATE;
+    /// Who proves a node, where a test does not care.
+    const PAYEE: Payee = [0x5a; 20];
 
     /// Cached `(key, signature)` pairs as the API takes them, every one at
     /// `epoch` over the cache's message for it.
@@ -3220,7 +3443,16 @@ mod tests {
     }
 
     fn prove_leaf(signers: &[(XmssPublicKey, XmssSignature)]) -> EthereumProof {
-        aggregate(&[], at_epoch(signers, XMSS_EPOCH_A), vec![], &[], None, LOG_INV_RATE).expect("leaf aggregates")
+        aggregate(
+            &[],
+            at_epoch(signers, XMSS_EPOCH_A),
+            vec![],
+            &[],
+            None,
+            PAYEE,
+            LOG_INV_RATE,
+        )
+        .expect("leaf aggregates")
     }
 
     #[test]
@@ -3284,7 +3516,7 @@ mod tests {
     type RawSphincs = (SphincsPublicKey, sphincs::Message, SphincsSignature);
 
     fn prove_sphincs_leaf(signers: &[RawSphincs]) -> EthereumProof {
-        aggregate(&[], vec![], signers.to_vec(), &[], None, LOG_INV_RATE).expect("leaf aggregates")
+        aggregate(&[], vec![], signers.to_vec(), &[], None, PAYEE, LOG_INV_RATE).expect("leaf aggregates")
     }
 
     #[test]
@@ -3317,6 +3549,7 @@ mod tests {
             get_sphincs_signers(3),
             &[],
             None,
+            PAYEE,
             LOG_INV_RATE,
         )
         .expect("leaf aggregates");
@@ -3333,11 +3566,20 @@ mod tests {
         let xmss = get_signers(6);
         let sphincs = get_sphincs_signers(4);
         let leaf = |x: &[(XmssPublicKey, XmssSignature)], s: &[RawSphincs]| {
-            aggregate(&[], at_epoch(x, XMSS_EPOCH_A), s.to_vec(), &[], None, LOG_INV_RATE).expect("leaf aggregates")
+            aggregate(
+                &[],
+                at_epoch(x, XMSS_EPOCH_A),
+                s.to_vec(),
+                &[],
+                None,
+                PAYEE,
+                LOG_INV_RATE,
+            )
+            .expect("leaf aggregates")
         };
         let left = leaf(&xmss[..4], &sphincs[..3]);
         let right = leaf(&xmss[3..], &sphincs[2..]);
-        let node = aggregate(&[left, right], vec![], vec![], &[], None, LOG_INV_RATE).expect("node aggregates");
+        let node = aggregate(&[left, right], vec![], vec![], &[], None, PAYEE, LOG_INV_RATE).expect("node aggregates");
         node.verify().expect("node verifies");
         assert_eq!((xmss_claims(&node), node.sphincs_signers.len()), (6, 4));
         assert!(node.xmss_signers[0].keys.windows(2).all(|w| w[0] < w[1]));
@@ -3353,8 +3595,16 @@ mod tests {
         lean_vm::init_prover_pool();
         let xmss_child = prove_leaf(&get_signers(3));
         let sphincs_child = prove_sphincs_leaf(&get_sphincs_signers(2));
-        let node =
-            aggregate(&[xmss_child, sphincs_child], vec![], vec![], &[], None, LOG_INV_RATE).expect("node aggregates");
+        let node = aggregate(
+            &[xmss_child, sphincs_child],
+            vec![],
+            vec![],
+            &[],
+            None,
+            PAYEE,
+            LOG_INV_RATE,
+        )
+        .expect("node aggregates");
         node.verify().expect("node verifies");
         assert_eq!((xmss_claims(&node), node.sphincs_signers.len()), (3, 2));
     }
@@ -3539,7 +3789,7 @@ def main():
         let signers = get_signers(SMALL_LEAF_SIZE + big);
         let left = prove_leaf(&signers[..SMALL_LEAF_SIZE]);
         let right = prove_leaf(&signers[SMALL_LEAF_SIZE..]);
-        let node = aggregate(&[left, right], vec![], vec![], &[], None, LOG_INV_RATE).expect("node aggregates");
+        let node = aggregate(&[left, right], vec![], vec![], &[], None, PAYEE, LOG_INV_RATE).expect("node aggregates");
         node.verify().expect("node verifies");
         assert_eq!(xmss_claims(&node), SMALL_LEAF_SIZE + big);
     }
@@ -3559,7 +3809,7 @@ def main():
         lean_vm::init_prover_pool();
         let rows = da_rows(3, 97);
 
-        let node = aggregate(&[], vec![], vec![], &rows, None, LOG_INV_RATE).expect("node aggregates");
+        let node = aggregate(&[], vec![], vec![], &rows, None, PAYEE, LOG_INV_RATE).expect("node aggregates");
         node.verify().expect("node verifies");
         assert_eq!(node.num_signature_claims(), 0);
 
@@ -3595,6 +3845,7 @@ def main():
                     signatures: &SignatureClaims::default(),
                     da_commitments: &unknown
                 }),
+                PAYEE,
                 LOG_INV_RATE
             )
             .unwrap_err(),
@@ -3611,6 +3862,7 @@ def main():
                     signatures: &SignatureClaims::default(),
                     da_commitments: &too_many
                 }),
+                PAYEE,
                 LOG_INV_RATE
             )
             .unwrap_err(),
@@ -3625,7 +3877,18 @@ def main():
         let mut children = Vec::new();
         for seed in [509, 510] {
             let rows = da_rows(1, seed);
-            children.push(aggregate(&[], at_epoch(&signers, XMSS_EPOCH_A), vec![], &rows, None, LOG_INV_RATE).unwrap());
+            children.push(
+                aggregate(
+                    &[],
+                    at_epoch(&signers, XMSS_EPOCH_A),
+                    vec![],
+                    &rows,
+                    None,
+                    PAYEE,
+                    LOG_INV_RATE,
+                )
+                .unwrap(),
+            );
         }
         let signatures = SignatureClaims {
             xmss: children[0].xmss_signers.clone(),
@@ -3652,6 +3915,7 @@ def main():
                     signatures: &signatures,
                     da_commitments: roots,
                 }),
+                PAYEE,
                 LOG_INV_RATE,
             )
             .unwrap();
@@ -3674,6 +3938,7 @@ def main():
             vec![],
             &[],
             None,
+            PAYEE,
             LOG_INV_RATE,
         )
         .unwrap();
@@ -3686,6 +3951,7 @@ def main():
             vec![],
             &same_rows,
             None,
+            PAYEE,
             LOG_INV_RATE,
         )
         .unwrap();
@@ -3704,6 +3970,7 @@ def main():
                     signatures: &signatures,
                     da_commitments: &selected,
                 }),
+                PAYEE,
                 LOG_INV_RATE,
             )
             .unwrap();
@@ -3720,11 +3987,12 @@ def main():
                     signatures: &signatures,
                     da_commitments: &[[0xa5; 32]]
                 }),
+                PAYEE,
                 LOG_INV_RATE
             ),
             Err(AggregationError::BlobNotCovered)
         ));
-        let direct = aggregate(&children, vec![], vec![], &rows, None, LOG_INV_RATE).unwrap();
+        let direct = aggregate(&children, vec![], vec![], &rows, None, PAYEE, LOG_INV_RATE).unwrap();
         direct.verify().unwrap();
         let mut three = both.clone();
         three.push(new_root);
@@ -3732,7 +4000,7 @@ def main():
         assert_eq!(direct.da_roots, three);
         let received = EthereumProof::from_bytes(&direct.to_bytes()).unwrap();
         received.verify().unwrap();
-        let nested = aggregate(&[received, repeated], vec![], vec![], &[], None, LOG_INV_RATE).unwrap();
+        let nested = aggregate(&[received, repeated], vec![], vec![], &[], None, PAYEE, LOG_INV_RATE).unwrap();
         nested.verify().unwrap();
         assert_eq!(nested.da_roots, three);
         let narrowed = aggregate(
@@ -3744,6 +4012,7 @@ def main():
                 signatures: &signatures,
                 da_commitments: &[second],
             }),
+            PAYEE,
             LOG_INV_RATE,
         )
         .unwrap();
@@ -3758,6 +4027,7 @@ def main():
                 signatures: &signatures,
                 da_commitments: &[],
             }),
+            PAYEE,
             LOG_INV_RATE,
         )
         .unwrap();
@@ -3774,6 +4044,7 @@ def main():
                     signatures: &signatures,
                     da_commitments: &[second]
                 }),
+                PAYEE,
                 LOG_INV_RATE
             ),
             Err(AggregationError::BlobNotCovered)
@@ -3788,6 +4059,7 @@ def main():
                     signatures: &signatures,
                     da_commitments: &[[0xa5; 32]]
                 }),
+                PAYEE,
                 LOG_INV_RATE
             ),
             Err(AggregationError::BlobNotCovered)
@@ -3805,8 +4077,9 @@ def main():
                     rows: &[],
                     roots: Some(&[second]),
                 },
+                PAYEE,
                 LOG_INV_RATE,
-                |h| {
+                |h, _, _| {
                     h.entries("da_index")[0] = vec![index];
                 },
             );
@@ -3818,8 +4091,9 @@ def main():
             vec![],
             None,
             DaInput::default(),
+            PAYEE,
             LOG_INV_RATE,
-            |h| {
+            |h, _, _| {
                 h.entries("da_index")[1] = h.entries("da_index")[0].clone();
             },
         );
@@ -3839,8 +4113,9 @@ def main():
                     rows: &[],
                     roots: Some(&[second]),
                 },
+                PAYEE,
                 LOG_INV_RATE,
-                |h| {
+                |h, _, _| {
                     h.entries("da_meta")[0] = vec![count(declared), count(duplicates)];
                     h.entries("da_roots").push(da_claim_cells(&second));
                 },
@@ -3857,8 +4132,9 @@ def main():
                     rows: &[],
                     roots: selected,
                 },
+                PAYEE,
                 LOG_INV_RATE,
-                |h| {
+                |h, _, _| {
                     let root = h
                         .entries("da_roots")
                         .iter_mut()
@@ -3879,8 +4155,9 @@ def main():
                     rows: &[],
                     roots: Some(&[second]),
                 },
+                PAYEE,
                 LOG_INV_RATE,
-                |h| {
+                |h, _, _| {
                     let omitted = h
                         .entries("da_roots")
                         .iter_mut()
@@ -3916,15 +4193,15 @@ def main():
         let mut expected = Vec::new();
         for seed in 600..605 {
             let rows = da_rows(1, seed);
-            let leaf = aggregate(&[], vec![], vec![], &rows, None, LOG_INV_RATE).unwrap();
+            let leaf = aggregate(&[], vec![], vec![], &rows, None, PAYEE, LOG_INV_RATE).unwrap();
             expected.extend_from_slice(leaf.da_commitments());
             leaves.push(leaf);
         }
-        let left = aggregate(&leaves[..2], vec![], vec![], &[], None, LOG_INV_RATE).unwrap();
-        let right = aggregate(&leaves[2..], vec![], vec![], &[], None, LOG_INV_RATE).unwrap();
+        let left = aggregate(&leaves[..2], vec![], vec![], &[], None, PAYEE, LOG_INV_RATE).unwrap();
+        let right = aggregate(&leaves[2..], vec![], vec![], &[], None, PAYEE, LOG_INV_RATE).unwrap();
         assert_eq!(left.da_commitments().len(), 2);
         assert_eq!(right.da_commitments().len(), 3);
-        let root = aggregate(&[left, right], vec![], vec![], &[], None, LOG_INV_RATE).unwrap();
+        let root = aggregate(&[left, right], vec![], vec![], &[], None, PAYEE, LOG_INV_RATE).unwrap();
         let root = EthereumProof::from_bytes(&root.to_bytes()).unwrap();
         root.verify().unwrap();
         expected.sort();
@@ -3940,7 +4217,7 @@ def main():
         let mut extra = root.clone();
         extra.da_roots = boundary[MAX_DA_ROOTS..].to_vec();
         assert_eq!(
-            aggregate(&[full, extra], vec![], vec![], &[], None, LOG_INV_RATE).unwrap_err(),
+            aggregate(&[full, extra], vec![], vec![], &[], None, PAYEE, LOG_INV_RATE).unwrap_err(),
             AggregationError::TooLarge,
             "reject the oversized union before verifying the modified child statements"
         );
@@ -4275,7 +4552,7 @@ def main():
         for symbols in [1, BLOB_SYMBOLS - 1, BLOB_SYMBOLS + 1, (DA_MAX_ROWS + 1) * BLOB_SYMBOLS] {
             let rows = vec![0; symbols];
             assert!(matches!(
-                aggregate(&[], vec![], vec![], &rows, None, LOG_INV_RATE),
+                aggregate(&[], vec![], vec![], &rows, None, PAYEE, LOG_INV_RATE),
                 Err(AggregationError::InvalidBlobSize { symbols: n }) if n == symbols
             ));
         }
@@ -4291,8 +4568,16 @@ def main():
         let signers = get_signers(SMALL_LEAF_SIZE);
         for n_rows in [1usize, 3, 4, 5] {
             let rows = da_rows(n_rows, 200 + n_rows as u64);
-            let node = aggregate(&[], at_epoch(&signers, XMSS_EPOCH_A), vec![], &rows, None, LOG_INV_RATE)
-                .expect("node aggregates");
+            let node = aggregate(
+                &[],
+                at_epoch(&signers, XMSS_EPOCH_A),
+                vec![],
+                &rows,
+                None,
+                PAYEE,
+                LOG_INV_RATE,
+            )
+            .expect("node aggregates");
             node.verify().expect("node verifies");
             let (commitment, _) = lean_da::commit(&rows);
             assert_eq!(node.da_roots, vec![commitment.root], "{n_rows} rows");
@@ -4323,6 +4608,7 @@ def main():
                 rows: &da_rows(1, 7),
                 roots: None,
             },
+            PAYEE,
             LOG_INV_RATE,
         );
         for n_rows in [1usize, 6, 14, 32] {
@@ -4337,6 +4623,7 @@ def main():
                     rows: &rows,
                     roots: None,
                 },
+                PAYEE,
                 LOG_INV_RATE,
             )
             .expect("node aggregates");
@@ -4387,7 +4674,7 @@ def main():
                 (public_key, epoch, message_for(epoch), signature)
             })
             .collect();
-        let leaf = aggregate(&[], raw, vec![], &[], None, LOG_INV_RATE).expect("many-group leaf aggregates");
+        let leaf = aggregate(&[], raw, vec![], &[], None, PAYEE, LOG_INV_RATE).expect("many-group leaf aggregates");
         leaf.verify().expect("it verifies");
         assert_eq!(leaf.xmss_signers.len(), groups);
         assert!(leaf.xmss_signers.iter().all(|group| group.keys.len() == 1));
@@ -4403,7 +4690,7 @@ def main():
         let at_b = get_signers_at(2, XMSS_EPOCH_B);
         let mut raw = at_epoch(&at_a, XMSS_EPOCH_A);
         raw.extend(at_epoch(&at_b, XMSS_EPOCH_B));
-        let wide = aggregate(&[], raw, vec![], &[], None, LOG_INV_RATE).expect("the wide leaf aggregates");
+        let wide = aggregate(&[], raw, vec![], &[], None, PAYEE, LOG_INV_RATE).expect("the wide leaf aggregates");
         wide.verify().expect("the wide leaf verifies");
         assert_eq!(wide.xmss_signers.len(), 2);
         assert_eq!(xmss_claims(&wide), 5);
@@ -4418,6 +4705,7 @@ def main():
                     signatures: declare,
                     da_commitments: &[],
                 }),
+                PAYEE,
                 LOG_INV_RATE,
             )
         };
@@ -4535,6 +4823,7 @@ def main():
                 },
                 da_commitments: &[],
             }),
+            PAYEE,
             LOG_INV_RATE,
         )
         .expect("the narrowing leaf aggregates");
@@ -4548,10 +4837,19 @@ def main():
         let at_a = get_signers(4);
         let at_b = get_signers_at(2, XMSS_EPOCH_B);
         assert_eq!(at_a[0].0, at_b[0].0, "the cache reuses keys across epochs");
-        let left = aggregate(&[], at_epoch(&at_a[..3], XMSS_EPOCH_A), vec![], &[], None, LOG_INV_RATE).expect("left");
+        let left = aggregate(
+            &[],
+            at_epoch(&at_a[..3], XMSS_EPOCH_A),
+            vec![],
+            &[],
+            None,
+            PAYEE,
+            LOG_INV_RATE,
+        )
+        .expect("left");
         let mut right_raw = at_epoch(&at_a[2..], XMSS_EPOCH_A);
         right_raw.extend(at_epoch(&at_b, XMSS_EPOCH_B));
-        let right = aggregate(&[], right_raw, vec![], &[], None, LOG_INV_RATE).expect("right");
+        let right = aggregate(&[], right_raw, vec![], &[], None, PAYEE, LOG_INV_RATE).expect("right");
         right.verify().expect("the two-epoch leaf verifies");
         // A second message at epoch A is its own group, beside `left`'s.
         let (sk, pk) = xmss::key_gen_from_seed([42; 32], XMSS_EPOCH_A, XMSS_EPOCH_A).expect("keygen");
@@ -4562,6 +4860,7 @@ def main():
             vec![],
             &[],
             None,
+            PAYEE,
             LOG_INV_RATE,
         )
         .expect("two messages at one epoch aggregate");
@@ -4578,7 +4877,7 @@ def main():
             ]
         );
         assert_eq!(crossed.xmss_signers[1].keys, vec![pk]);
-        let node = aggregate(&[left, right], vec![], vec![], &[], None, LOG_INV_RATE).expect("node");
+        let node = aggregate(&[left, right], vec![], vec![], &[], None, PAYEE, LOG_INV_RATE).expect("node");
         node.verify().expect("the two-epoch node verifies");
         let messages: Vec<xmss::Message> = node.xmss_signers.iter().map(|group| group.message).collect();
         assert_eq!(messages, vec![message(), message_for(XMSS_EPOCH_B)]);
@@ -4621,7 +4920,7 @@ def main():
         let signers = get_signers(40);
         let left = prove_leaf(&signers[..25]);
         let right = prove_leaf(&signers[15..]);
-        let node = aggregate(&[left, right], vec![], vec![], &[], None, LOG_INV_RATE).expect("node aggregates");
+        let node = aggregate(&[left, right], vec![], vec![], &[], None, PAYEE, LOG_INV_RATE).expect("node aggregates");
         node.verify().expect("node verifies");
         assert_eq!(xmss_claims(&node), 40);
         assert!(node.xmss_signers[0].keys.windows(2).all(|w| w[0] < w[1]));
@@ -4648,12 +4947,13 @@ def main():
                 sphincs.to_vec(),
                 &[],
                 None,
+                PAYEE,
                 LOG_INV_RATE,
             )
             .expect("leaf aggregates")
         };
         let node = |children: &[EthereumProof]| {
-            aggregate(children, vec![], vec![], &[], None, LOG_INV_RATE).expect("node aggregates")
+            aggregate(children, vec![], vec![], &[], None, PAYEE, LOG_INV_RATE).expect("node aggregates")
         };
         // Claim 1 is under both nodes; claim 4 arrives raw at the root, and so
         // do two XMSS signatures at a second epoch, so the root holds a group
@@ -4666,6 +4966,7 @@ def main():
             claims[4..].to_vec(),
             &[],
             None,
+            PAYEE,
             LOG_INV_RATE,
         )
         .expect("root aggregates");
@@ -4687,11 +4988,33 @@ def main():
         lean_vm::init_prover_pool();
         let signers = get_signers(2 * SMALL_LEAF_SIZE);
         let left = prove_leaf(&signers[..SMALL_LEAF_SIZE]);
-        let right = prove_leaf(&signers[SMALL_LEAF_SIZE..]);
+        // One SPHINCS claim of the right child's own, so the node credits a payee
+        // besides itself.
+        const OTHER: Payee = [0xb2; 20];
+        let right = aggregate(
+            &[],
+            at_epoch(&signers[SMALL_LEAF_SIZE..], XMSS_EPOCH_A),
+            get_sphincs_signers(4)[3..].to_vec(),
+            &[],
+            None,
+            OTHER,
+            LOG_INV_RATE,
+        )
+        .expect("right");
         // Mixed, so both published lists are non-empty and every tampering
         // below has a SPHINCS counterpart.
-        let node = aggregate(&[left, right], vec![], get_sphincs_signers(3), &[], None, LOG_INV_RATE).expect("node");
+        let node = aggregate(
+            &[left, right],
+            vec![],
+            get_sphincs_signers(3),
+            &[],
+            None,
+            PAYEE,
+            LOG_INV_RATE,
+        )
+        .expect("node");
         node.verify().expect("the honest node verifies");
+        assert_eq!(node.payees, [PAYEE, OTHER]);
 
         assert_eq!(
             EthereumProof::from_bytes(&node.to_bytes())
@@ -4726,8 +5049,11 @@ def main():
         tampered(&|s| {
             s.sphincs_signers.swap(0, 1);
         });
+        // The credit list follows the claims it is aligned with, so these reach
+        // the statement rather than the host's shape check.
         tampered(&|s| {
             s.sphincs_signers.pop();
+            s.sphincs_credits.pop();
         });
         // Relabelling a signer's scheme: the same 32 bytes moved to the other
         // list. Every count and the splits between them are in the statement, and
@@ -4741,6 +5067,8 @@ def main():
             );
             s.sphincs_signers.push(claimed);
             s.sphincs_signers.sort();
+            let at = s.sphincs_signers.binary_search(&claimed).expect("just inserted");
+            s.sphincs_credits.insert(at, 0);
         });
         tampered(&|s| s.xmss_signers[0].epoch += 1);
         tampered(&|s| s.xmss_signers[0].message[0] ^= 1);
@@ -4749,6 +5077,27 @@ def main():
         tampered(&|s| s.sphincs_signers[0].1[0] ^= 1);
         tampered(&|s| s.defer.bytecode_point[0] += F192::ONE);
         tampered(&|s| s.defer.matrix_point[0] += F192::ONE);
+        // Who verified each SPHINCS claim is in the statement too: neither payee
+        // can be renamed, nor a claim moved to the other one.
+        tampered(&|s| s.payees[0][0] ^= 1);
+        tampered(&|s| s.payees[1][0] ^= 1);
+        tampered(&|s| s.payees.swap(0, 1));
+        tampered(&|s| s.payees.push([0xff; 20]));
+        tampered(&|s| {
+            let from_child = s
+                .sphincs_credits
+                .iter()
+                .position(|&c| c == 1)
+                .expect("the child's claim");
+            s.sphincs_credits[from_child] = 0;
+        });
+        tampered(&|s| {
+            let raw = s.sphincs_credits.iter().position(|&c| c == 0).expect("a raw claim");
+            s.sphincs_credits[raw] = 1;
+        });
+        tampered(&|s| {
+            s.sphincs_credits.pop();
+        });
         tampered(&|s| s.xmss_signers[0].keys[0] = get_signers(2 * SMALL_LEAF_SIZE + 1)[2 * SMALL_LEAF_SIZE].0.clone());
         // Splitting one group's keys across two epochs: the same claims cannot
         // be re-attributed to an epoch nothing signed at.
@@ -4796,6 +5145,8 @@ def main():
     }
 
     type Tamper<'a> = (&'a str, &'a dyn Fn(&mut Hints));
+    /// A hook that may also lie about the payee table and credits published.
+    type CreditHook<'a> = &'a dyn Fn(&mut Hints, &mut Vec<Payee>, &mut Vec<u16>);
 
     /// Corrupt each security-critical hint and require rejection.
     #[test]
@@ -4804,6 +5155,21 @@ def main():
         lean_vm::init_prover_pool();
         let signers = get_signers(2 * SMALL_LEAF_SIZE);
 
+        let rejects_credits =
+            |children: &[EthereumProof], raw_sphincs: Vec<RawSphincs>, description: &str, tamper: CreditHook| {
+                let outcome = aggregate_tampered(
+                    children,
+                    vec![],
+                    raw_sphincs,
+                    None,
+                    DaInput::default(),
+                    PAYEE,
+                    LOG_INV_RATE,
+                    |hints, payees, credits| tamper(hints, payees, credits),
+                )
+                .map(|(signature, _)| signature.verify().is_ok());
+                assert!(!matches!(outcome, Ok(true)), "tampering {description} must be rejected");
+            };
         let rejects = |children: &[EthereumProof],
                        raw_signatures: Vec<(XmssPublicKey, xmss::Epoch, xmss::Message, XmssSignature)>,
                        raw_sphincs: Vec<RawSphincs>,
@@ -4815,8 +5181,9 @@ def main():
                 raw_sphincs,
                 None,
                 DaInput::default(),
+                PAYEE,
                 LOG_INV_RATE,
-                |hints| tamper(hints),
+                |hints, _, _| tamper(hints),
             )
             .map(|(signature, _)| signature.verify().is_ok());
             assert!(!matches!(outcome, Ok(true)), "tampering {description} must be rejected");
@@ -4890,7 +5257,7 @@ def main():
         // groups' tweak tables cannot be swapped.
         let mut two_epoch_raw = at_epoch(&signers[..2], XMSS_EPOCH_A);
         two_epoch_raw.extend(at_epoch(&get_signers_at(1, XMSS_EPOCH_B), XMSS_EPOCH_B));
-        aggregate(&[], two_epoch_raw.clone(), vec![], &[], None, LOG_INV_RATE)
+        aggregate(&[], two_epoch_raw.clone(), vec![], &[], None, PAYEE, LOG_INV_RATE)
             .expect("the honest two-epoch leaf aggregates");
         let two_epoch_cases: &[Tamper] = &[
             (
@@ -4926,8 +5293,16 @@ def main():
         // other's declared key, which is what the statement's split claims.
         let mixed_xmss = at_epoch(&signers[..3], XMSS_EPOCH_A);
         let mixed_sphincs = get_sphincs_signers(2);
-        aggregate(&[], mixed_xmss.clone(), mixed_sphincs.clone(), &[], None, LOG_INV_RATE)
-            .expect("the honest mixed leaf aggregates");
+        aggregate(
+            &[],
+            mixed_xmss.clone(),
+            mixed_sphincs.clone(),
+            &[],
+            None,
+            PAYEE,
+            LOG_INV_RATE,
+        )
+        .expect("the honest mixed leaf aggregates");
         let mixed_cases: &[Tamper] = &[
             (
                 "raw_index (an XMSS signature reaching the SPHINCS region)",
@@ -4984,7 +5359,7 @@ def main():
         let left = prove_leaf(&signers[..SMALL_LEAF_SIZE]);
         let right = prove_leaf(&signers[SMALL_LEAF_SIZE..]);
         let children = vec![left, right];
-        aggregate(&children, vec![], vec![], &[], None, LOG_INV_RATE).expect("the honest node aggregates");
+        aggregate(&children, vec![], vec![], &[], None, PAYEE, LOG_INV_RATE).expect("the honest node aggregates");
         let node_cases: &[Tamper] = &[
             ("column placement (swapped)", &|h: &mut Hints| {
                 h.entries("col_sort_order")[0].swap(0, 1);
@@ -5093,11 +5468,12 @@ def main():
                 vec![],
                 &[],
                 None,
+                PAYEE,
                 LOG_INV_RATE,
             )
             .expect("the honest epoch-B leaf aggregates"),
         ];
-        aggregate(&epoch_children, vec![], vec![], &[], None, LOG_INV_RATE)
+        aggregate(&epoch_children, vec![], vec![], &[], None, PAYEE, LOG_INV_RATE)
             .expect("the honest two-epoch node aggregates");
         let epoch_node_cases: &[Tamper] = &[
             // Pointing the second child's group at the parent's epoch-A region:
@@ -5118,8 +5494,16 @@ def main():
         // the cases above do not reach them: these children carry claims.
         let sphincs = get_sphincs_signers(4);
         let mixed_child = |x: &[(XmssPublicKey, XmssSignature)], s: &[RawSphincs]| {
-            aggregate(&[], at_epoch(x, XMSS_EPOCH_A), s.to_vec(), &[], None, LOG_INV_RATE)
-                .expect("the honest mixed child aggregates")
+            aggregate(
+                &[],
+                at_epoch(x, XMSS_EPOCH_A),
+                s.to_vec(),
+                &[],
+                None,
+                PAYEE,
+                LOG_INV_RATE,
+            )
+            .expect("the honest mixed child aggregates")
         };
         let mixed_children = vec![
             mixed_child(&signers[..2], &sphincs[..2]),
@@ -5140,6 +5524,217 @@ def main():
         for (description, tamper) in mixed_node_cases {
             rejects(&mixed_children, vec![], vec![], description, *tamper);
         }
+
+        // Credits. Two children proved by two other payees and a raw signature of
+        // this node's own, so its table is [PAYEE, A, B] and each rule has a claim
+        // to break. A lie about a credit is told in the statement as well as in the
+        // witness where it needs to be, or the statement digest alone would catch it.
+        const A: Payee = [0xa1; 20];
+        const B: Payee = [0xb2; 20];
+        let claims = get_sphincs_signers(5);
+        let credited_children = vec![
+            aggregate(&[], vec![], claims[..2].to_vec(), &[], None, A, LOG_INV_RATE).expect("child A aggregates"),
+            aggregate(&[], vec![], claims[2..4].to_vec(), &[], None, B, LOG_INV_RATE).expect("child B aggregates"),
+        ];
+        let honest = aggregate(
+            &credited_children,
+            vec![],
+            claims[4..].to_vec(),
+            &[],
+            None,
+            PAYEE,
+            LOG_INV_RATE,
+        )
+        .expect("the honest credited node aggregates");
+        assert_eq!(honest.payees, [PAYEE, A, B]);
+        let relabel = |credits: &mut Vec<u16>, from: u16, to: u16| {
+            credits.iter_mut().filter(|c| **c == from).for_each(|c| *c = to);
+        };
+        let credit_cases: &[(&str, CreditHook)] = &[
+            // Rule 1: a raw signature credits this node and no one else.
+            ("credits (a raw claim credited to a child's payee)", &|_, _, c| {
+                relabel(c, 0, 1)
+            }),
+            // Rule 2: a child's claim keeps its child's credit.
+            ("credits (a child's claim credited to this node)", &|_, _, c| {
+                relabel(c, 1, 0)
+            }),
+            ("credit_map (a child's payee mapped to this node's own)", &|h, _, c| {
+                relabel(c, 1, 0);
+                h.entries("credit_map")[0] = vec![count(0)];
+            }),
+            ("credit_map (one child's payee mapped to the other's)", &|h, _, c| {
+                relabel(c, 1, 2);
+                h.entries("credit_map")[0] = vec![count(2)];
+            }),
+            ("credit_map (a payee this node keeps, dropped)", &|h, _, _| {
+                h.entries("credit_map")[0] = vec![F192::ZERO];
+            }),
+            // The table entry a child's payee maps to, renamed to one of this
+            // node's choosing: the map compares addresses, not indices.
+            ("payees (a child's payee renamed in this node's table)", &|h, p, _| {
+                let renamed: Payee = [0xa0; 20];
+                p[1] = renamed;
+                h.entries("credit_cells")[0][2..4].copy_from_slice(&payee_cells(&renamed));
+            }),
+            // The range and address checks, reached by a child's credit past its
+            // table and by a child payee this node's table does not hold. Stream
+            // order: this node's table (two entries), then per child its table
+            // and its credits.
+            ("credit_cells (a child's credit past its table)", &|h, _, _| {
+                h.entries("credit_cells")[3][0] = count(1);
+            }),
+            ("credit_cells (a child's payee)", &|h, _, _| {
+                h.entries("credit_cells")[2][0] += F192::ONE;
+            }),
+            ("child_payees (a child's table cut short)", &|h, _, _| {
+                h.entries("child_payees")[0] = vec![count(0)];
+            }),
+            ("credit_split (a last block past the run)", &|h, _, _| {
+                h.entries("credit_split")[0][2] = count(3);
+            }),
+        ];
+        for (description, tamper) in credit_cases {
+            rejects_credits(&credited_children, claims[4..].to_vec(), description, *tamper);
+        }
+
+        // Rule 3 alone: the child's table and list are the ones its statement
+        // carries. A child with two payees, C over A's leaf plus a raw claim of its
+        // own, so a lie can stay inside the range and address checks, told in this
+        // node's statement too: only the rebuilt child statement is left to catch it.
+        const C: Payee = [0xc3; 20];
+        let two_payee_child = aggregate(
+            &[credited_children[0].clone()],
+            vec![],
+            claims[4..].to_vec(),
+            &[],
+            None,
+            C,
+            LOG_INV_RATE,
+        )
+        .expect("the two-payee child aggregates");
+        assert_eq!(two_payee_child.payees, [C, A]);
+        let child = [two_payee_child];
+        let honest = aggregate(&child, vec![], vec![], &[], None, PAYEE, LOG_INV_RATE)
+            .expect("the honest node over a two-payee child aggregates");
+        assert_eq!(honest.payees, [PAYEE, A, C]);
+        let child_payees = child[0].payees.clone();
+        let child_cases: &[(&str, CreditHook)] = &[
+            // Stream order: this node's table (two entries), the child's (one), then
+            // the child's credits. Claim 0 is the same claim in both lists.
+            ("credit_cells (a child's claim moved to its other payee)", &|h, p, c| {
+                let cell = &mut h.entries("credit_cells")[3][0];
+                let moved = usize::from(*cell == count(0));
+                *cell = count(moved);
+                c[0] = p.iter().position(|q| *q == child_payees[moved]).expect("in the table") as u16;
+            }),
+            ("credit_cells (a child's payee renamed in both tables)", &|h, p, _| {
+                let renamed: Payee = [0xa7; 20];
+                p[1] = renamed;
+                h.entries("credit_cells")[0][2..4].copy_from_slice(&payee_cells(&renamed));
+                h.entries("credit_cells")[2][2..4].copy_from_slice(&payee_cells(&renamed));
+            }),
+        ];
+        for (description, tamper) in child_cases {
+            rejects_credits(&child, vec![], description, *tamper);
+        }
+    }
+
+    /// Credit lists long enough to cross a whole hash window (`SIGNERS_WINDOW`
+    /// blocks of four credits), with credits that vary: the node's own list, from
+    /// memory, and the same list rebuilt from hints by its parent.
+    #[test]
+    fn credit_lists_cross_a_hash_window() {
+        lean_vm::init_prover_pool();
+        const A: Payee = [0xa1; 20];
+        let n = 4 * SIGNERS_WINDOW;
+        let claims = get_sphincs_signers(n + 1);
+        let leaf = aggregate(&[], vec![], claims[..n].to_vec(), &[], None, A, LOG_INV_RATE).expect("leaf aggregates");
+        let node =
+            aggregate(&[leaf], vec![], claims[n..].to_vec(), &[], None, PAYEE, LOG_INV_RATE).expect("node aggregates");
+        node.verify().expect("node verifies");
+        assert_eq!(node.payees, [PAYEE, A]);
+        let raw = node
+            .sphincs_signers
+            .iter()
+            .position(|c| *c == (claims[n].0, claims[n].1))
+            .unwrap();
+        assert!(
+            node.sphincs_credits
+                .iter()
+                .enumerate()
+                .all(|(i, &c)| c == u16::from(i != raw))
+        );
+        let root = aggregate(&[node], vec![], vec![], &[], None, PAYEE, LOG_INV_RATE).expect("root aggregates");
+        root.verify().expect("root verifies");
+        assert_eq!(root.sphincs_credits.len(), n + 1);
+    }
+
+    /// Each SPHINCS claim stays credited to the node that verified its signature
+    /// raw, through every fold. A raw signature credits the node's own payee, a
+    /// child's claim keeps its child's, and an overlap goes to the occurrence that
+    /// takes the claim's declared slot: a raw signature first, then the children in
+    /// order. A node keeps only the payees its declared claims name, so publishing
+    /// less drops the rest, and a node folding its own earlier aggregate maps its
+    /// own payee onto itself.
+    #[test]
+    fn sphincs_credits_follow_the_verifier() {
+        lean_vm::init_prover_pool();
+        const A: Payee = [0xa1; 20];
+        const B: Payee = [0xb2; 20];
+        const N: Payee = [0x0c; 20];
+        const M: Payee = [0x0d; 20];
+        let claims = get_sphincs_signers(6);
+        let claim = |i: usize| (claims[i].0, claims[i].1);
+        let credited = |proof: &EthereumProof| -> Vec<(SphincsClaim, Payee)> {
+            (0..proof.sphincs_signers.len())
+                .map(|i| (proof.sphincs_signers[i], *proof.sphincs_payee(i)))
+                .collect()
+        };
+        let expected = |pairs: &[(usize, Payee)]| {
+            let mut pairs: Vec<(SphincsClaim, Payee)> = pairs.iter().map(|&(i, p)| (claim(i), p)).collect();
+            pairs.sort();
+            pairs
+        };
+        let leaf = |range: std::ops::Range<usize>, payee: Payee| {
+            aggregate(&[], vec![], claims[range].to_vec(), &[], None, payee, LOG_INV_RATE).expect("leaf aggregates")
+        };
+        let a = leaf(0..3, A);
+        assert_eq!(credited(&a), expected(&[(0, A), (1, A), (2, A)]));
+        let b = leaf(2..5, B);
+        // Claim 2 is under both children and goes to the first; claim 1 also
+        // arrives raw, which comes first; claim 5 arrives raw alone.
+        let raw = vec![claims[1].clone(), claims[5].clone()];
+        let node = aggregate(&[a, b], vec![], raw, &[], None, N, LOG_INV_RATE).expect("node aggregates");
+        node.verify().expect("node verifies");
+        assert_eq!(node.payees, [N, A, B]);
+        assert_eq!(
+            credited(&node),
+            expected(&[(0, A), (1, N), (2, A), (3, B), (4, B), (5, N)])
+        );
+
+        // Publishing B's claims alone: A and N drop out of the table, their claims
+        // kept only in duplicate slots.
+        let kept = SignatureClaims {
+            xmss: vec![],
+            sphincs: expected(&[(3, B), (4, B)]).into_iter().map(|(c, _)| c).collect(),
+        };
+        let selection = ClaimSelection {
+            signatures: &kept,
+            da_commitments: &[],
+        };
+        let narrowed =
+            aggregate(&[node], vec![], vec![], &[], Some(selection), M, LOG_INV_RATE).expect("narrowed aggregates");
+        narrowed.verify().expect("narrowed verifies");
+        assert_eq!(narrowed.payees, [M, B]);
+        assert_eq!(credited(&narrowed), expected(&[(3, B), (4, B)]));
+
+        // M folds its own aggregate and one more raw signature.
+        let again = aggregate(&[narrowed], vec![], vec![claims[0].clone()], &[], None, M, LOG_INV_RATE)
+            .expect("the next fold aggregates");
+        again.verify().expect("the next fold verifies");
+        assert_eq!(again.payees, [M, B]);
+        assert_eq!(credited(&again), expected(&[(0, M), (3, B), (4, B)]));
     }
 
     #[test]
@@ -5149,14 +5744,14 @@ def main():
         let mut raw_signatures = at_epoch(&get_signers(3), XMSS_EPOCH_A);
         raw_signatures[1].3.wots_signature.chain_tips[0][0] ^= 1;
         assert!(
-            aggregate(&[], raw_signatures, vec![], &[], None, LOG_INV_RATE).is_err(),
+            aggregate(&[], raw_signatures, vec![], &[], None, PAYEE, LOG_INV_RATE).is_err(),
             "a forged signature must be rejected"
         );
 
         let mut raw_sphincs = get_sphincs_signers(2);
         raw_sphincs[1].2.ots[2][0][0] ^= 1;
         assert!(
-            aggregate(&[], vec![], raw_sphincs, &[], None, LOG_INV_RATE).is_err(),
+            aggregate(&[], vec![], raw_sphincs, &[], None, PAYEE, LOG_INV_RATE).is_err(),
             "a forged SPHINCS signature must be rejected"
         );
     }
@@ -5201,6 +5796,7 @@ def main():
                 vec![],
                 &[],
                 None,
+                PAYEE,
                 LOG_INV_RATE
             )
             .err(),
@@ -5218,7 +5814,7 @@ def main():
         assert!(sphincs::verify(&public_key, &signed, &signature).is_err());
         let raw = vec![(public_key, signed, signature)];
         assert_eq!(
-            aggregate(&[], vec![], raw, &[], None, LOG_INV_RATE).err(),
+            aggregate(&[], vec![], raw, &[], None, PAYEE, LOG_INV_RATE).err(),
             Some(AggregationError::MalformedRawSignature)
         );
     }

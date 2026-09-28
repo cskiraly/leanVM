@@ -10,8 +10,8 @@ pub mod signers_cache;
 
 pub use aggregation::{
     AggregateVerifyError, AggregationError, ClaimSelection, DA_LOG_CELL, DA_LOG_K, DA_MAX_ROWS, EthereumProof,
-    MAX_DA_ROOTS, MAX_EPOCHS, MAX_KEYS, MAX_RECURSIONS, SignatureClaims, SphincsClaim, XmssClaimGroup, aggregate,
-    warm_up,
+    MAX_DA_ROOTS, MAX_EPOCHS, MAX_KEYS, MAX_PAYEES, MAX_RECURSIONS, Payee, SignatureClaims, SphincsClaim,
+    XmssClaimGroup, aggregate, warm_up,
 };
 pub use benchmark::{run_aggregation, run_recursion};
 pub use fibonacci::run_fibonacci;

@@ -5,6 +5,10 @@ const EPOCH_B: xmss::Epoch = 11;
 const MSG_0: xmss::Message = [0; xmss::MESSAGE_LEN];
 const MSG_1: xmss::Message = [1; xmss::MESSAGE_LEN];
 const MSG_2: xmss::Message = [2; xmss::MESSAGE_LEN];
+// Who proves each node: a raw SPHINCS signature credits its node's payee, through every fold.
+const LEFT: Payee = [0xa1; 20];
+const RIGHT: Payee = [0xb2; 20];
+const ROOT: Payee = [0xc3; 20];
 
 #[test]
 fn public_api_end_to_end() {
@@ -40,6 +44,7 @@ fn public_api_end_to_end() {
         sphincs_input[..1].to_vec(),
         &blobs,
         None,
+        LEFT,
         2,
     )
     .unwrap();
@@ -54,12 +59,13 @@ fn public_api_end_to_end() {
         sphincs_input[1..].to_vec(),
         &other_blobs,
         None,
+        RIGHT,
         2,
     )
     .unwrap();
     let mut roots = vec![commitment.root, other_commitment.root];
     roots.sort();
-    let root = aggregate(&[left, right], xmss_input[7..].to_vec(), vec![], &[], None, 2).unwrap();
+    let root = aggregate(&[left, right], xmss_input[7..].to_vec(), vec![], &[], None, ROOT, 2).unwrap();
     assert_eq!(root.num_signature_claims(), 11);
     assert_eq!(root.da_commitments(), roots);
 
@@ -75,6 +81,14 @@ fn public_api_end_to_end() {
         .map(|group| (group.epoch, group.message))
         .collect();
     assert_eq!(pairs, vec![(EPOCH_A, MSG_0), (EPOCH_A, MSG_1), (EPOCH_B, MSG_2)]);
+    for (i, &(pk, message)) in received.sphincs_signers().iter().enumerate() {
+        let verifier = if (pk, message) == (sphincs_input[0].0, sphincs_input[0].1) {
+            LEFT
+        } else {
+            RIGHT
+        };
+        assert_eq!(received.sphincs_payee(i), &verifier);
+    }
 
     // 5. Removing some signatures from the aggregate: `declare` is what we keep. Here the first group goes whole.
     let mut groups = received.xmss_signers().to_vec();
@@ -94,6 +108,7 @@ fn public_api_end_to_end() {
             signatures: &retained_signatures,
             da_commitments: &[commitment.root],
         }),
+        ROOT,
         2,
     )
     .unwrap();
@@ -115,6 +130,7 @@ fn public_api_end_to_end() {
             signatures: &retained_signatures,
             da_commitments: &[],
         }),
+        ROOT,
         2,
     )
     .unwrap();
