@@ -64,6 +64,9 @@ enum Command {
         /// SPHINCS signatures in each child, on top of the XMSS ones.
         #[arg(long, default_value = "0")]
         sphincs_per_leaf: usize,
+        /// Every child holds the same SPHINCS signatures, each under its own payee.
+        #[arg(long)]
+        sphincs_overlap: bool,
         /// Blobs in each child's LeanDA commitment. Use --xmss-per-leaf 0 for blobs alone.
         #[arg(
             long,
@@ -95,12 +98,14 @@ fn main() {
             n,
             xmss_per_leaf,
             sphincs_per_leaf,
+            sphincs_overlap,
             blobs_per_leaf,
         } => {
             rec_aggregation::run_recursion(
                 n,
                 xmss_per_leaf,
                 sphincs_per_leaf,
+                sphincs_overlap,
                 blobs_per_leaf,
                 cli.log_inv_rate,
                 cli.tracing,

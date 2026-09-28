@@ -297,6 +297,68 @@ fn credit_digest(payees: &[Payee], credits: &[u16]) -> [F192; 2] {
 
 /// A SPHINCS signer as the four cells the guest hashes and `verify_sig_sphincs`
 /// reads: the key, then the message that key signed.
+/// `1 + 2^16 + 2^32 + 2^48`: `x^NORM_EXP` is the norm from `K` to its
+/// `2^16`-element subfield.
+const NORM_EXP: u64 = 1 + (1 << 16) + (1 << 32) + (1 << 48);
+/// `65535^-1 mod NORM_EXP`, so `w^ROOT_EXP` is a `65535`-th root of any `w` of norm 1.
+const ROOT_EXP: u64 = 0xc000_8000_4000;
+/// The number of overlap keys: the order of `N(g)`.
+const CREDIT_KEYS: usize = (1 << 16) - 1;
+
+fn f64_pow(mut base: F64, mut exp: u64) -> F64 {
+    let mut acc = F64::ONE;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            acc *= base;
+        }
+        base = base.square();
+        exp >>= 1;
+    }
+    acc
+}
+
+/// One occurrence of a SPHINCS claim's overlap key, as the guest's `credit_key`
+/// checks it: `key` is the discrete log, base `N(g)`, of `N(l)`, with `l` the first
+/// 64-bit lane of `BLAKE2s(claim ‖ payee)` (the payee zero-padded to 32 bytes) and
+/// `N` the norm to the `2^16`-element subfield, so it is uniform below 65535. A
+/// zero lane has key 0. `root` is the guest's witness, `u` in `K` with
+/// `g^key / l = u^(2^16 - 1)`, unread for a zero lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CreditKey {
+    key: usize,
+    root: F64,
+}
+
+fn credit_key(claim: &SphincsClaim, payee: &Payee) -> CreditKey {
+    let bytes = cell_bytes(sphincs_signer_cells(claim).into_iter().chain(payee_cells(payee)));
+    let digest = primitives::hash::hash(&bytes);
+    lane_key(F64(u64::from_le_bytes(digest[..8].try_into().expect("8 bytes"))))
+}
+
+fn lane_key(lane: F64) -> CreditKey {
+    if lane.is_zero() {
+        return CreditKey { key: 0, root: F64::ONE };
+    }
+    // N(g)^i -> i, the discrete logs in the subfield.
+    static LOGS: std::sync::OnceLock<std::collections::HashMap<u64, usize>> = std::sync::OnceLock::new();
+    let logs = LOGS.get_or_init(|| {
+        let h = f64_pow(G, NORM_EXP);
+        let mut power = F64::ONE;
+        (0..CREDIT_KEYS)
+            .map(|i| {
+                let entry = (power.0, i);
+                power *= h;
+                entry
+            })
+            .collect()
+    });
+    let key = logs[&f64_pow(lane, NORM_EXP).0];
+    CreditKey {
+        key,
+        root: f64_pow(g_pow(key) * lane.inv(), ROOT_EXP),
+    }
+}
+
 fn sphincs_signer_cells((pk, message): &SphincsClaim) -> [F192; 4] {
     [
         pack_16_bytes(&pk.root),
@@ -784,8 +846,9 @@ impl EthereumProof {
     /// How many SPHINCS coverage slots the fold that produced this aggregate filled
     /// with claims it does not publish (a claim dropped, or a second copy it chose
     /// not to link to its published slot). Zero means every other occurrence of a
-    /// published claim that fold held is linked to it, which is what a rule over a
-    /// claim's candidate credits needs. It says nothing of the folds below.
+    /// published claim that fold held is linked to it, so the fold credited each
+    /// such claim to the occurrence with the least key. It says nothing of the
+    /// folds below.
     pub fn sphincs_omitted(&self) -> u16 {
         self.sphincs_omitted
     }
@@ -924,7 +987,9 @@ impl EthereumProof {
     /// [`Self::da_commitments`] also attests to a well-formed blob matrix; callers check
     /// that this list contains the commitments they require. Each SPHINCS claim's
     /// credit names the node that verified its signature raw, as that node's prover
-    /// chose to name itself; no node on the way could move it to another payee.
+    /// chose to name itself; no node on the way could move it to another payee. Of
+    /// several such nodes, it is the one with the least key, if the last fold
+    /// omitted nothing ([`Self::sphincs_omitted`]).
     pub fn verify(&self) -> Result<(), AggregateVerifyError> {
         check_signer_set(&self.xmss_signers, &self.sphincs_signers)?;
         check_credits(&self.payees, &self.sphincs_credits, self.sphincs_signers.len())?;
@@ -1906,6 +1971,8 @@ struct Coverage {
     /// published, one slot an occurrence.
     sphincs_links: Vec<usize>,
     sphincs_omitted: Vec<SphincsClaim>,
+    /// Per linked copy, the published occurrence's key and the copy's.
+    sphincs_link_keys: Vec<[CreditKey; 2]>,
     /// Offsets within each raw signature's own group region, indexed as `raw_xmss`.
     raw_xmss: Vec<usize>,
     /// `raw_xmss` indices in the guest's walk order: it walks the table, whose
@@ -1938,7 +2005,8 @@ impl Coverage {
 
 /// A claim takes its declared slot once; subsequent or omitted occurrences take
 /// fresh slots outside the hashed prefix. First come is a policy: the guest accepts
-/// any occurrence in the declared slot, which for a SPHINCS claim decides its credit.
+/// any occurrence in the declared slot. SPHINCS claims, whose slot decides their
+/// credit, are placed by [`plan_coverage`] instead.
 fn take_slot<K: Ord + Clone>(claims: &[K], claimed: &mut [bool], duplicates: &mut Vec<K>, claim: &K) -> usize {
     match claims.binary_search(claim) {
         Ok(pos) if !claimed[pos] => {
@@ -1952,39 +2020,12 @@ fn take_slot<K: Ord + Clone>(claims: &[K], claimed: &mut [bool], duplicates: &mu
     }
 }
 
-/// [`take_slot`] for the SPHINCS region, whose duplicate slots are split: a
-/// later occurrence of a declared claim takes the next of the `n_links` linked
-/// slots right after the declared ones, recording which claim it copies, and an
-/// occurrence of an undeclared claim the next omitted slot after those.
-fn take_sphincs_slot(
-    claims: &[SphincsClaim],
-    claimed: &mut [bool],
-    links: &mut Vec<usize>,
-    n_links: usize,
-    omitted: &mut Vec<SphincsClaim>,
-    claim: &SphincsClaim,
-) -> usize {
-    match claims.binary_search(claim) {
-        Ok(pos) if !claimed[pos] => {
-            claimed[pos] = true;
-            pos
-        }
-        Ok(pos) => {
-            links.push(pos);
-            claims.len() + links.len() - 1
-        }
-        Err(_) => {
-            omitted.push(*claim);
-            claims.len() + n_links + omitted.len() - 1
-        }
-    }
-}
-
 fn plan_coverage(
     raw_xmss: &[(XmssPublicKey, xmss::Epoch, xmss::Message)],
     raw_sphincs: &[SphincsClaim],
     children: &[EthereumProof],
     declare: Option<&SignatureClaims>,
+    payee: Payee,
 ) -> Result<Coverage, AggregationError> {
     // The union, as `(epoch, message, key)` claims, then grouped: consecutive
     // equal `(epoch, message)` pairs of the sorted deduplicated list are one group.
@@ -2056,27 +2097,67 @@ fn plan_coverage(
         .collect();
     let mut xmss_claimed: Vec<Vec<bool>> = xmss_groups.iter().map(|group| vec![false; group.keys.len()]).collect();
     let mut xmss_dups: Vec<Vec<XmssPublicKey>> = vec![Vec::new(); xmss_groups.len()];
-    let mut sphincs_claimed = vec![false; sphincs_signers.len()];
-    // Every declared claim occurs at least once, so the rest of their occurrences
-    // are the linked copies, which go ahead of the omitted slots.
-    let n_links = raw_sphincs
+    let n_sphincs = sphincs_signers.len();
+    // The SPHINCS occurrences in the guest's walk order, raw then each child's
+    // list, with the payee each credits. A declared claim's published slot goes to
+    // its occurrence with the least credit key, the first of them on a tie; the
+    // rest are its linked copies, which go ahead of the omitted slots. Keys are
+    // only computed for claims that occur more than once.
+    let occurrences: Vec<(SphincsClaim, Payee)> = raw_sphincs
         .iter()
-        .chain(children.iter().flat_map(|child| &child.sphincs_signers))
-        .filter(|signer| sphincs_signers.binary_search(signer).is_ok())
-        .count()
-        - sphincs_signers.len();
+        .map(|claim| (*claim, payee))
+        .chain(children.iter().flat_map(|child| {
+            child
+                .sphincs_signers
+                .iter()
+                .zip(&child.sphincs_credits)
+                .map(|(claim, &credit)| (*claim, child.payees[usize::from(credit)]))
+        }))
+        .collect();
+    let position: Vec<Option<usize>> = occurrences
+        .iter()
+        .map(|(claim, _)| sphincs_signers.binary_search(claim).ok())
+        .collect();
+    let mut seen = vec![0usize; n_sphincs];
+    for &pos in position.iter().flatten() {
+        seen[pos] += 1;
+    }
+    let keys: Vec<Option<CreditKey>> = occurrences
+        .iter()
+        .zip(&position)
+        .map(|((claim, credited), pos)| pos.filter(|&q| seen[q] > 1).map(|_| credit_key(claim, credited)))
+        .collect();
+    let mut winner: Vec<Option<usize>> = vec![None; n_sphincs];
+    for (o, pos) in position.iter().enumerate() {
+        if let Some(q) = *pos {
+            match winner[q] {
+                Some(w) if keys[w].map(|k| k.key) <= keys[o].map(|k| k.key) => {}
+                _ => winner[q] = Some(o),
+            }
+        }
+    }
+    let n_links = seen.iter().sum::<usize>() - n_sphincs;
     let mut sphincs_links = Vec::with_capacity(n_links);
+    let mut sphincs_link_keys = Vec::with_capacity(n_links);
     let mut sphincs_omitted = Vec::new();
-    let mut take_sphincs = |signer: &SphincsClaim| {
-        take_sphincs_slot(
-            &sphincs_signers,
-            &mut sphincs_claimed,
-            &mut sphincs_links,
-            n_links,
-            &mut sphincs_omitted,
-            signer,
-        )
-    };
+    let sphincs_slots: Vec<usize> = occurrences
+        .iter()
+        .enumerate()
+        .map(|(o, (claim, _))| match position[o] {
+            Some(q) if winner[q] == Some(o) => q,
+            Some(q) => {
+                sphincs_links.push(q);
+                let published = winner[q].expect("a declared claim occurs");
+                sphincs_link_keys.push([keys[published], keys[o]].map(|k| k.expect("an overlapping claim")));
+                n_sphincs + sphincs_links.len() - 1
+            }
+            None => {
+                sphincs_omitted.push(*claim);
+                n_sphincs + n_links + sphincs_omitted.len() - 1
+            }
+        })
+        .collect();
+    let (raw_sphincs_slots, mut child_slots) = sphincs_slots.split_at(raw_sphincs.len());
     let raw_xmss_slots: Vec<usize> = raw_xmss
         .iter()
         .map(|(pk, epoch, message)| {
@@ -2084,7 +2165,6 @@ fn plan_coverage(
             take_slot(&xmss_groups[g].keys, &mut xmss_claimed[g], &mut xmss_dups[g], pk)
         })
         .collect();
-    let raw_sphincs_slots: Vec<usize> = raw_sphincs.iter().map(&mut take_sphincs).collect();
     let mut child_xmss = Vec::with_capacity(children.len());
     let mut child_sphincs = Vec::with_capacity(children.len());
     for child in children {
@@ -2103,7 +2183,9 @@ fn plan_coverage(
                 })
                 .collect::<Vec<(usize, Vec<usize>)>>(),
         );
-        child_sphincs.push(child.sphincs_signers.iter().map(&mut take_sphincs).collect());
+        let (slots, rest) = child_slots.split_at(child.sphincs_signers.len());
+        child_sphincs.push(slots.to_vec());
+        child_slots = rest;
     }
     // Stable, so signatures within a group keep the order their slots were taken in.
     let mut raw_walk: Vec<usize> = (0..raw_xmss.len()).collect();
@@ -2115,9 +2197,10 @@ fn plan_coverage(
         sphincs_signers,
         sphincs_links,
         sphincs_omitted,
+        sphincs_link_keys,
         raw_xmss: raw_xmss_slots,
         raw_walk,
-        raw_sphincs: raw_sphincs_slots,
+        raw_sphincs: raw_sphincs_slots.to_vec(),
         child_xmss,
         child_sphincs,
     };
@@ -2127,18 +2210,14 @@ fn plan_coverage(
     Ok(cover)
 }
 /// Who is credited for each declared SPHINCS claim, and the payee table the credits
-/// index: the occurrence that takes a claim's declared slot, in the guest's walk
-/// order, is the one credited (a raw signature credits `payee`, a child's claim
+/// index: the occurrence that takes a claim's declared slot is the one credited (a raw signature credits `payee`, a child's claim
 /// keeps its child's credit). The table is `payee`, then every other payee a
 /// declared claim credits, sorted: a child's payee that no declared claim names is
 /// dropped, its map entry 0.
 ///
 /// Which occurrence of a claim covered more than once takes its declared slot is
-/// this host's policy ([`take_slot`]: raw first, then the children in order), not
-/// a guest rule: another prover may credit any occurrence it holds. Tightening it
-/// means a guest rule over the candidates, such as a fixed tie-break, the least
-/// `H(claim ‖ payee)`, or crediting every raw verifier (`doc/leanvm` §Checking
-/// coverage).
+/// [`plan_coverage`]'s: the least [`credit_key`], which the guest enforces in a
+/// node that omits nothing.
 fn plan_credits(
     cover: &Coverage,
     children: &[EthereumProof],
@@ -2415,7 +2494,7 @@ pub(crate) fn aggregate_tampered(
         .map(|(pk, epoch, message, _)| (pk.clone(), *epoch, *message))
         .collect();
     let raw_sphincs_keys: Vec<SphincsClaim> = raw_sphincs.iter().map(|(pk, message, _)| (*pk, *message)).collect();
-    let cover = plan_coverage(&raw_xmss_claims, &raw_sphincs_keys, children, declare)?;
+    let cover = plan_coverage(&raw_xmss_claims, &raw_sphincs_keys, children, declare, payee)?;
     let da_contributions =
         usize::from(!rows.is_empty()) + children.iter().map(|child| child.da_roots.len()).sum::<usize>();
     if cover.n_total() + da_contributions >= MAX_KEYS {
@@ -2494,6 +2573,16 @@ pub(crate) fn aggregate_tampered(
     }
     for &pos in &cover.sphincs_links {
         hints.push("sphincs_link", vec![count(pos)]);
+    }
+    // The overlap rule runs only in a node that omits nothing: per linked copy, the
+    // published occurrence's key, then the copy's.
+    if cover.sphincs_omitted.is_empty() {
+        for pair in &cover.sphincs_link_keys {
+            for k in pair {
+                hints.push("credit_key", vec![count(k.key)]);
+                hints.push("credit_key_root", vec![F192::from(k.root)]);
+            }
+        }
     }
     for signer in &cover.sphincs_omitted {
         hints.push("dup_sphincs", sphincs_signer_cells(signer).to_vec());
@@ -3513,21 +3602,21 @@ mod tests {
             check_signer_set(&spread(MAX_EPOCHS + 1), &[]),
             Err(AggregateVerifyError::MalformedSignerSet)
         );
-        plan_coverage(&claims(&full[..MAX_KEYS - 1]), &[], &[], None).expect("one short of the cap");
+        plan_coverage(&claims(&full[..MAX_KEYS - 1]), &[], &[], None, PAYEE).expect("one short of the cap");
         assert_eq!(
-            plan_coverage(&claims(&full), &[], &[], None).err(),
+            plan_coverage(&claims(&full), &[], &[], None, PAYEE).err(),
             Some(AggregationError::TooLarge)
         );
         assert_eq!(
-            plan_coverage(&claims(&full[..MAX_KEYS - 1]), &claim, &[], None).err(),
+            plan_coverage(&claims(&full[..MAX_KEYS - 1]), &claim, &[], None, PAYEE).err(),
             Some(AggregationError::TooLarge)
         );
         let spread_claims = |n: usize| -> Vec<(XmssPublicKey, xmss::Epoch, xmss::Message)> {
             (0..n).map(|e| (full[e].clone(), e as u32, message())).collect()
         };
-        plan_coverage(&spread_claims(MAX_EPOCHS), &[], &[], None).expect("at the epoch cap");
+        plan_coverage(&spread_claims(MAX_EPOCHS), &[], &[], None, PAYEE).expect("at the epoch cap");
         assert_eq!(
-            plan_coverage(&spread_claims(MAX_EPOCHS + 1), &[], &[], None).err(),
+            plan_coverage(&spread_claims(MAX_EPOCHS + 1), &[], &[], None, PAYEE).err(),
             Some(AggregationError::TooManyEpochs)
         );
     }
@@ -5776,9 +5865,8 @@ def main():
 
     /// Each SPHINCS claim stays credited to the node that verified its signature
     /// raw, through every fold. A raw signature credits the node's own payee, a
-    /// child's claim keeps its child's, and an overlap goes to the occurrence that
-    /// takes the claim's declared slot: a raw signature first, then the children in
-    /// order. A node keeps only the payees its declared claims name, so publishing
+    /// child's claim keeps its child's, and an overlap goes to the occurrence with
+    /// the least credit key. A node keeps only the payees its declared claims name, so publishing
     /// less drops the rest, and a node folding its own earlier aggregate maps its
     /// own payee onto itself.
     #[test]
@@ -5803,20 +5891,31 @@ def main():
         let leaf = |range: std::ops::Range<usize>, payee: Payee| {
             aggregate(&[], vec![], claims[range].to_vec(), &[], None, payee, LOG_INV_RATE).expect("leaf aggregates")
         };
+        let least = |i: usize, candidates: [Payee; 2]| {
+            let keys = candidates.map(|p| credit_key(&claim(i), &p).key);
+            assert_ne!(keys[0], keys[1], "a tie would make the fixture say nothing");
+            if keys[0] < keys[1] {
+                candidates[0]
+            } else {
+                candidates[1]
+            }
+        };
         let a = leaf(0..3, A);
         assert_eq!(credited(&a), expected(&[(0, A), (1, A), (2, A)]));
         let b = leaf(2..5, B);
-        // Claim 2 is under both children and goes to the first; claim 1 also
-        // arrives raw, which comes first; claim 5 arrives raw alone.
+        // Claim 2 is under both children, claim 1 under A and raw: each goes to
+        // the least key. Claim 5 arrives raw alone.
         let raw = vec![claims[1].clone(), claims[5].clone()];
         let node = aggregate(&[a, b], vec![], raw, &[], None, N, LOG_INV_RATE).expect("node aggregates");
         node.verify().expect("node verifies");
         assert_eq!(node.sphincs_omitted(), 0, "every copy is linked to its claim");
-        assert_eq!(node.payees, [N, A, B]);
+        let (one, two) = (least(1, [N, A]), least(2, [A, B]));
         assert_eq!(
             credited(&node),
-            expected(&[(0, A), (1, N), (2, A), (3, B), (4, B), (5, N)])
+            expected(&[(0, A), (1, one), (2, two), (3, B), (4, B), (5, N)])
         );
+        let others: BTreeSet<Payee> = [A, B, one, two].into_iter().filter(|p| *p != N).collect();
+        assert_eq!(node.payees, std::iter::once(N).chain(others).collect::<Vec<_>>());
 
         // Publishing B's claims alone: A and N drop out of the table, their claims
         // kept only in duplicate slots.
@@ -5848,6 +5947,242 @@ def main():
         assert_eq!(credited(&again), expected(&[(0, M), (3, B), (4, B)]));
     }
 
+    /// The key gadget alone, over lanes chosen here rather than hashed: an honest
+    /// witness passes, and each lie that satisfies all but one check is caught by
+    /// that one. A zero lane has key 0.
+    #[test]
+    fn credit_key_gadget_pins_one_key() {
+        let (helpers, _) = include_str!("../guests/lean_ethereum.py")
+            .split_once("\ndef main():")
+            .unwrap();
+        let source = format!(
+            r#"{helpers}
+def main():
+    lane = hint_witness("lane")
+    key = lane_key(lane)
+    public = GEN ** 0
+    assert public[1] == key
+    return
+"#
+        );
+        let guest = compile(&parse_with_replacements(&source, &placeholder_map(18)).unwrap());
+        let accepts = |lane: F192, key: F192, root: F192| {
+            let mut hints = Hints::default();
+            hints.push("lane", vec![lane]);
+            hints.push("credit_key", vec![key]);
+            hints.push("credit_key_root", vec![root]);
+            let mut program = guest.clone();
+            hints.install(&mut program);
+            program.execute([key, F192::ZERO]).is_ok()
+        };
+        let honest = |lane: u64| {
+            let k = lane_key(F64(lane));
+            (F192::from(F64(lane)), count(k.key), F192::from(k.root), k)
+        };
+        for lane in [1, 2, 0x1234_5678_9abc_def0, u64::MAX] {
+            let (l, key, root, k) = honest(lane);
+            assert!(accepts(l, key, root), "the honest key of lane {lane:#x}");
+            assert!(!accepts(l, count((k.key + 1) % CREDIT_KEYS), root), "another key");
+            assert!(!accepts(l, count(0), F192::ZERO), "a zero root");
+            // g^(e + 65535), with root u·g: the norm check passes, the bound does not.
+            let past = F192::new(g_pow(k.key + CREDIT_KEYS).0, 0, 0);
+            assert!(!accepts(l, past, root * F192::from(G)), "a key past the bound");
+        }
+        assert!(accepts(F192::ZERO, count(0), F192::ONE), "a zero lane's key is 0");
+        assert!(!accepts(F192::ZERO, count(5), F192::ONE), "and nothing else");
+        // A root outside K: r^3 = g, so r^65535 = g^21845 and lane 1 passes the norm
+        // check at key 21845, whose true key is 0 (Codex's witness).
+        let r = F192::new(0, 0x73d4_b9f3_63ec_e01e, 0x9fb3_cbfd_b807_8c63);
+        let g = F192::from(G);
+        assert_eq!(r * r * r, g, "a cube root of g");
+        let mut power = r;
+        for _ in 0..16 {
+            power = power * power;
+        }
+        let x = count(21845);
+        assert_eq!(x * r, power, "the equation holds");
+        assert_eq!(lane_key(F64::ONE).key, 0);
+        assert!(!accepts(F192::ONE, x, r), "a root outside K");
+    }
+
+    /// A claim covered more than once is credited to the payee with the least
+    /// credit key among its occurrences, whatever the order and shape of the folds,
+    /// and a node that omits nothing cannot credit another. One that omits may.
+    #[test]
+    fn overlap_credit_is_the_least_key() {
+        lean_vm::init_prover_pool();
+        const A: Payee = [0xa1; 20];
+        const B: Payee = [0xb2; 20];
+        const C: Payee = [0xc3; 20];
+        let claims = get_sphincs_signers(6);
+        let leaf = |range: std::ops::Range<usize>, payee: Payee| {
+            aggregate(&[], vec![], claims[range].to_vec(), &[], None, payee, LOG_INV_RATE).expect("leaf aggregates")
+        };
+        let fold = |children: &[EthereumProof]| {
+            let node = aggregate(children, vec![], vec![], &[], None, PAYEE, LOG_INV_RATE).expect("node aggregates");
+            node.verify().expect("node verifies");
+            assert_eq!(node.sphincs_omitted(), 0);
+            node
+        };
+        let credited = |proof: &EthereumProof| -> Vec<(SphincsClaim, Payee)> {
+            (0..proof.sphincs_signers.len())
+                .map(|i| (proof.sphincs_signers[i], *proof.sphincs_payee(i)))
+                .collect()
+        };
+        // Three verifiers over the same six claims: each claim's winner is the
+        // least of three keys, and the fixture has more than one winner.
+        let (a, b, c) = (leaf(0..6, A), leaf(0..6, B), leaf(0..6, C));
+        let mut expected: Vec<(SphincsClaim, Payee)> = claims
+            .iter()
+            .map(|(pk, message, _)| {
+                let claim = (*pk, *message);
+                let winner = *[A, B, C]
+                    .iter()
+                    .min_by_key(|p| credit_key(&claim, p).key)
+                    .expect("three");
+                (claim, winner)
+            })
+            .collect();
+        expected.sort();
+        let winners: BTreeSet<Payee> = expected.iter().map(|(_, p)| *p).collect();
+        assert!(
+            winners.len() > 1,
+            "a fixture with one winner says nothing about per-claim choice"
+        );
+        let orders = [
+            fold(&[fold(&[a.clone(), b.clone()]), c.clone()]),
+            fold(&[fold(&[c.clone(), b.clone()]), a.clone()]),
+            fold(&[b.clone(), c.clone(), a.clone()]),
+        ];
+        for node in &orders {
+            assert_eq!(credited(node), expected);
+        }
+        // Raw against a child: the node's own payee is one more candidate.
+        let raw = vec![claims[0].clone()];
+        let node =
+            aggregate(std::slice::from_ref(&a), vec![], raw, &[], None, PAYEE, LOG_INV_RATE).expect("node aggregates");
+        node.verify().expect("node verifies");
+        let claim0 = (claims[0].0, claims[0].1);
+        let own = credit_key(&claim0, &PAYEE).key < credit_key(&claim0, &A).key;
+        let at = node
+            .sphincs_signers
+            .iter()
+            .position(|c| *c == claim0)
+            .expect("published");
+        assert_eq!(*node.sphincs_payee(at), if own { PAYEE } else { A });
+
+        // Two children overlapping on claim 1 only, so both payees stay in the
+        // table whichever wins. The lie swaps which occurrence takes the published
+        // slot, with the published credit, and the two keys, to match.
+        let (left, right) = (leaf(0..2, A), leaf(1..3, B));
+        let x = (claims[1].0, claims[1].1);
+        let loser = if credit_key(&x, &A).key < credit_key(&x, &B).key {
+            B
+        } else {
+            A
+        };
+        let in_left = left
+            .sphincs_signers
+            .iter()
+            .position(|c| *c == x)
+            .expect("in the left child");
+        let in_right = right
+            .sphincs_signers
+            .iter()
+            .position(|c| *c == x)
+            .expect("in the right child");
+        let n_left = left.sphincs_signers.len();
+        let mut published = claims[..3].iter().map(|(pk, m, _)| (*pk, *m)).collect::<Vec<_>>();
+        published.sort();
+        let at = published.iter().position(|c| *c == x).expect("published");
+        let swap = |h: &mut Hints, p: &mut Vec<Payee>, c: &mut Vec<u16>| {
+            h.entries("child_sphincs_index").swap(in_left, n_left + in_right);
+            c[at] = p.iter().position(|q| *q == loser).expect("in the table") as u16;
+        };
+        let swap_keys = |h: &mut Hints| {
+            h.entries("credit_key").swap(0, 1);
+            h.entries("credit_key_root").swap(0, 1);
+        };
+        let children = [left, right];
+        type SlotHook<'a> = &'a dyn Fn(&mut Hints, &mut Vec<Payee>, &mut Vec<u16>);
+        let outcome = |declare: Option<&SignatureClaims>, raw: Vec<RawSphincs>, tamper: SlotHook| {
+            aggregate_tampered(
+                &children,
+                vec![],
+                raw,
+                declare,
+                DaInput::default(),
+                PAYEE,
+                LOG_INV_RATE,
+                |h, p, c, _| tamper(h, p, c),
+            )
+            .map(|(proof, _)| {
+                (
+                    proof.verify().is_ok(),
+                    proof.sphincs_omitted(),
+                    *proof.sphincs_payee(at),
+                )
+            })
+        };
+        let (honest, omitted, credit) = outcome(None, vec![], &|_, _, _| {}).expect("the honest node proves");
+        assert!(honest && omitted == 0 && credit != loser);
+        assert!(
+            !matches!(
+                outcome(None, vec![], &|h, p, c| {
+                    swap(h, p, c);
+                    swap_keys(h)
+                }),
+                Ok((true, ..))
+            ),
+            "crediting the larger key must be rejected"
+        );
+        assert!(
+            !matches!(outcome(None, vec![], &|h, p, c| swap(h, p, c)), Ok((true, ..))),
+            "the keys, left unswapped, must not fit the swapped payees"
+        );
+        // The swap with the keys lied about. A zero root satisfies the norm check
+        // for any key; and e + 65535, with root u·g, passes it too, the norm having
+        // order 65535, so only the bound keeps the key unique.
+        let winner = if loser == A { B } else { A };
+        let key_w = credit_key(&x, &winner).key;
+        assert!(
+            !matches!(
+                outcome(None, vec![], &|h, p, c| {
+                    swap(h, p, c);
+                    swap_keys(h);
+                    h.entries("credit_key")[0] = vec![count(0)];
+                    h.entries("credit_key_root")[0] = vec![F192::ZERO];
+                }),
+                Ok((true, ..))
+            ),
+            "a zero root must be rejected"
+        );
+        assert!(
+            !matches!(
+                outcome(None, vec![], &|h, p, c| {
+                    swap(h, p, c);
+                    swap_keys(h);
+                    h.entries("credit_key")[1] = vec![count(key_w + CREDIT_KEYS)];
+                    let root = h.entries("credit_key_root")[1][0];
+                    h.entries("credit_key_root")[1] = vec![root.mul_base(G)];
+                }),
+                Ok((true, ..))
+            ),
+            "a key past the bound must be rejected"
+        );
+        // Omitting a raw claim 3 lifts the rule, and the statement says so.
+        let declared = SignatureClaims {
+            xmss: vec![],
+            sphincs: published.clone(),
+        };
+        let raw = vec![claims[3].clone()];
+        assert_eq!(
+            outcome(Some(&declared), raw, &|h, p, c| swap(h, p, c)),
+            Ok((true, 1, loser)),
+            "a node that omits may credit either"
+        );
+    }
+
     /// A second occurrence of a published SPHINCS claim sits in a linked slot, a
     /// copy of the published slot it names; the claims a node covers and does not
     /// publish sit in the omitted slots after them, and the statement carries how
@@ -5855,15 +6190,15 @@ def main():
     #[test]
     fn sphincs_copies_link_to_their_claim() {
         lean_vm::init_prover_pool();
-        const A: Payee = [0xa1; 20];
-        const B: Payee = [0xb2; 20];
         let claims = get_sphincs_signers(3);
-        let leaf = |range: std::ops::Range<usize>, payee: Payee| {
-            aggregate(&[], vec![], claims[range].to_vec(), &[], None, payee, LOG_INV_RATE).expect("leaf aggregates")
+        let leaf = |range: std::ops::Range<usize>| {
+            aggregate(&[], vec![], claims[range].to_vec(), &[], None, PAYEE, LOG_INV_RATE).expect("leaf aggregates")
         };
         // Claim 1 arrives three times: raw, then under each child, so it takes its
-        // published slot and two linked ones.
-        let children = [leaf(0..2, A), leaf(1..3, B)];
+        // published slot and two linked ones. One payee throughout, so every
+        // occurrence has the same key and a link redirected to another copy of the
+        // claim leaves the overlap rule satisfied: only the link's bound is left.
+        let children = [leaf(0..2), leaf(1..3)];
         let raw = vec![claims[1].clone()];
         let copied = (claims[1].0, claims[1].1);
         type LinkHook<'a> = &'a dyn Fn(&mut Hints, &mut u16);

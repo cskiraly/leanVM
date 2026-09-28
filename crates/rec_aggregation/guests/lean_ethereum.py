@@ -2817,7 +2817,7 @@ def sphincs_list_digest(entries_ptr, n_g, g_squares):
     return digest[0], digest[1]
 
 
-def child_sphincs_window(state_0, state_1, base, entries_ptr, cover, marks, origin_g, limit_g, x_q, g_squares, sub_credits, credit_map, credits, n_sub_payees_g):
+def child_sphincs_window(state_0, state_1, base, entries_ptr, cover, marks, origin_g, limit_g, x_q, g_squares, sub_credits, credit_map, credits, n_sub_payees_g, sub_payees, payee_of):
     # One window of a child's SPHINCS list, absorbed exactly as the child absorbed
     # it, but with each block's claim read at a hinted index into THIS node's table
     # and marked in the coverage table. The index is an offset into the SPHINCS
@@ -2832,7 +2832,7 @@ def child_sphincs_window(state_0, state_1, base, entries_ptr, cover, marks, orig
         off_hint = hint_witness("child_sphincs_index")
         assert log(off_hint) < log(limit_g)  # precondition as in the raw loops
         cover[origin_g * off_hint] = marks * (GEN ** j)
-        credits[off_hint] = carry_credit(sub_credits[GEN ** j], credit_map, n_sub_payees_g)
+        carry_credit(off_hint, sub_credits[GEN ** j], credit_map, n_sub_payees_g, credits, sub_payees, payee_of)
         entry = entries_ptr * (off_hint ** 4)
         out = StackBuf(2)
         if const(j + 1 == SIGNERS_WINDOW):
@@ -2843,7 +2843,7 @@ def child_sphincs_window(state_0, state_1, base, entries_ptr, cover, marks, orig
     return st[0], st[1], nxt
 
 
-def child_sphincs_tail(state_0, state_1, base, entries_ptr, cover, marks, origin_g, limit_g, sub_credits, credit_map, credits, n_sub_payees_g, k: Const):
+def child_sphincs_tail(state_0, state_1, base, entries_ptr, cover, marks, origin_g, limit_g, sub_credits, credit_map, credits, n_sub_payees_g, sub_payees, payee_of, k: Const):
     # The blocks past the child's last whole window, all of them non-final, so every
     # offset stays below this base's lowest set bit.
     st = StackBuf(2)
@@ -2853,7 +2853,7 @@ def child_sphincs_tail(state_0, state_1, base, entries_ptr, cover, marks, origin
         off_hint = hint_witness("child_sphincs_index")
         assert log(off_hint) < log(limit_g)
         cover[origin_g * off_hint] = marks * (GEN ** j)
-        credits[off_hint] = carry_credit(sub_credits[GEN ** j], credit_map, n_sub_payees_g)
+        carry_credit(off_hint, sub_credits[GEN ** j], credit_map, n_sub_payees_g, credits, sub_payees, payee_of)
         entry = entries_ptr * (off_hint ** 4)
         out = StackBuf(2)
         blake2s(entry[0:2], entry[2:4], out, cv=st, md=base + const(64 * (j + 1)))
@@ -2861,7 +2861,7 @@ def child_sphincs_tail(state_0, state_1, base, entries_ptr, cover, marks, origin
     return st[0], st[1]
 
 
-def child_sphincs_list_digest(entries_ptr, cover, base, origin_g, limit_g, n_g, g_squares, sub_credits, credit_map, credits, n_sub_payees_g):
+def child_sphincs_list_digest(entries_ptr, cover, base, origin_g, limit_g, n_g, g_squares, sub_credits, credit_map, credits, n_sub_payees_g, sub_payees, payee_of):
     # BLAKE2s of a child's declared SPHINCS claims, over the same 64n bytes the
     # child hashed (`sphincs_list_digest`), so the digest it rebuilds is the one the
     # child's statement carries. `base` prefixes the coverage write values, which
@@ -2885,7 +2885,7 @@ def child_sphincs_list_digest(entries_ptr, cover, base, origin_g, limit_g, n_g, 
         for xq in mul_range(1, windows):
             slot = chain * (xq ** 4)
             marks = base * (xq ** SIGNERS_WINDOW)
-            s0, s1, nb = child_sphincs_window(slot[1], slot[GEN], slot[GEN ** 2], entries_ptr, cover, marks, origin_g, limit_g, xq, g_squares, sub_credits * (xq ** SIGNERS_WINDOW), credit_map, credits, n_sub_payees_g)
+            s0, s1, nb = child_sphincs_window(slot[1], slot[GEN], slot[GEN ** 2], entries_ptr, cover, marks, origin_g, limit_g, xq, g_squares, sub_credits * (xq ** SIGNERS_WINDOW), credit_map, credits, n_sub_payees_g, sub_payees, payee_of)
             step = chain * ((xq * GEN) ** 4)
             step[1] = s0
             step[GEN] = s1
@@ -2893,11 +2893,11 @@ def child_sphincs_list_digest(entries_ptr, cover, base, origin_g, limit_g, n_g, 
         end = chain * (windows ** 4)
         marks = base * (windows ** SIGNERS_WINDOW)
         tail_credits = sub_credits * (windows ** SIGNERS_WINDOW)
-        t0, t1 = match(log(tail), range(0, SIGNERS_WINDOW), lambda k: child_sphincs_tail(end[1], end[GEN], end[GEN ** 2], entries_ptr, cover, marks, origin_g, limit_g, tail_credits, credit_map, credits, n_sub_payees_g, k))
+        t0, t1 = match(log(tail), range(0, SIGNERS_WINDOW), lambda k: child_sphincs_tail(end[1], end[GEN], end[GEN ** 2], entries_ptr, cover, marks, origin_g, limit_g, tail_credits, credit_map, credits, n_sub_payees_g, sub_payees, payee_of, k))
         off_hint = hint_witness("child_sphincs_index")
         assert log(off_hint) < log(limit_g)
         cover[origin_g * off_hint] = base * (n_g * INV_GEN)
-        credits[off_hint] = carry_credit(sub_credits[n_g * INV_GEN], credit_map, n_sub_payees_g)
+        carry_credit(off_hint, sub_credits[n_g * INV_GEN], credit_map, n_sub_payees_g, credits, sub_payees, payee_of)
         entry = entries_ptr * (off_hint ** 4)
         final = scaled_log(n_g, g_squares, 6) + MD_FINAL
         blake2s(entry[0:2], entry[2:4], digest, cv=[t0, t1], md=final)
@@ -2905,13 +2905,17 @@ def child_sphincs_list_digest(entries_ptr, cover, base, origin_g, limit_g, n_g, 
 
 
 @inline
-def carry_credit(credit, credit_map, n_sub_payees_g):
+def carry_credit(off_hint, credit, credit_map, n_sub_payees_g, credits, sub_payees, payee_of):
     # A child's declared credit, g^i for its payee i, as an index into THIS node's
     # table. The bound is the one place a credit is range-checked: the child's own
     # guest writes whatever its map says, and whoever reads its list (this parent,
-    # or the outer verifier at the root) checks it.
+    # or the outer verifier at the root) checks it. The slot also records where
+    # the payee's address is, in the child's table, which holds it even when this
+    # node's does not.
     assert log(credit) < log(n_sub_payees_g)
-    return credit_map[credit]
+    credits[off_hint] = credit_map[credit]
+    payee_of[off_hint] = sub_payees * (credit * credit)
+    return
 
 
 def child_payee_map(payees, n_payees_g, sub_payees, n_sub_payees_g):
@@ -2931,6 +2935,47 @@ def child_payee_map(payees, n_payees_g, sub_payees, n_sub_payees_g):
             assert mine[GEN] == theirs[GEN]
         credit_map[xi] = k
     return credit_map
+
+
+def credit_key(prefix_0, prefix_1, payee):
+    # g^e for the key of one occurrence of a claim: e is the discrete log, base
+    # N(g), of N(l), where l is the first 64-bit lane of BLAKE2s(claim || payee)
+    # and N the norm from K down to its 2^16-element subfield, l^(1+2^16+2^32+2^48).
+    # N maps K* onto that subfield's 65535 nonzero elements evenly, so e is uniform
+    # below 65535 and shared by everyone who hashes the same pair. The prefix is
+    # the state after the claim's 64-byte block; the payee's two cells, a 20-byte
+    # address zero-padded, and a zero pair are the final block.
+    #
+    # The hinted g^e is checked without computing a norm: N(x) = N(l) iff x / l is
+    # a (2^16 - 1)-th power in K*, the norm's kernel, so the prover hints a root u
+    # in K and the guest checks x u = l u^(2^16). The bound e < 65535 then leaves
+    # one e, and a zero u, the one that would satisfy anything, is excluded. A zero
+    # lane has no norm to match, so its key is defined as 0: it would otherwise be
+    # unprovable, and a payee can grind its address to reach one.
+    digest = StackBuf(2)
+    blake2s(payee[0:2], [0, 0], digest, cv=[prefix_0, prefix_1], counter=96, final=1)
+    lane = StackBuf(1)
+    hint_f192_limbs(lane, digest[0])
+    assert_in_k(lane[0], (digest[0] + lane[0]) * Y_INV)
+    return lane_key(lane[0])
+
+
+@inline
+def lane_key(lane):
+    # `credit_key` past the hash: g^e for a lane in K.
+    key = hint_witness("credit_key")
+    root = hint_witness("credit_key_root")
+    assert log(key) < 65535
+    if lane == 0:
+        assert key == 1
+    else:
+        assert_in_k(root, key)
+        assert root != 0
+        power = root
+        for i in unroll(0, 16):
+            power = power * power
+        assert key * root == lane * power
+    return key
 
 
 def credit_digest(credits, n_claims_g, payee_0, payee_1, g_squares, hinted: Const):
@@ -3499,8 +3544,11 @@ def main():
     # claim covered twice lands in its declared slot is the prover's choice (the
     # "sp_raw_index" and "child_sphincs_index" hints), and so is that claim's
     # credit. The linked copies below tie each other occurrence of a declared
-    # claim to its slot, which is what a rule over the candidates compares.
+    # claim to its slot, and the overlap rule at the end compares them.
+    # `payee_of` points each slot at its occurrence's payee address: this node's
+    # own for a raw signature, the child's table entry for a child's claim.
     credits = HeapBuf(sphincs_slots_g)
+    payee_of = HeapBuf(sphincs_slots_g)
     # The run the set's hash covers: both lengths and the SPHINCS list's digest
     # in one block, then two a group. Eight cells a group, so a group's
     # header and its key digest are one block each.
@@ -3553,9 +3601,11 @@ def main():
     # does not publish; the statement carries their count, and a copy of a declared
     # claim may hide there too, so only a statement that omits nothing says every
     # other occurrence of a declared claim is linked to it.
+    links = HeapBuf(n_slink_g)
     for xd in mul_range(1, n_slink_g):
         idx = hint_witness("sphincs_link")
         assert log(idx) < log(n_sphincs_g)
+        links[xd] = idx
         dup = sphincs_table * ((n_sphincs_g * xd) ** 4)
         linked = sphincs_table * (idx ** 4)
         dup[1] = linked[1]
@@ -3611,6 +3661,7 @@ def main():
         assert log(off_hint) < log(sphincs_slots_g)
         cover[xmss_slots_g * off_hint] = n_raw_x_g * xj
         credits[off_hint] = 1  # a raw signature credits this node, payee 0
+        payee_of[off_hint] = payees
         verify_sig_sphincs(sphincs_table * (off_hint ** 4))
 
     if n_direct_da_g == GEN:
@@ -3658,7 +3709,7 @@ def main():
         credit_map = child_payee_map(payees, n_payees_g, sub_payees, nsub_p_g)
         sub_credits = HeapBuf(nsub_s_g)
         sub_cr_0, sub_cr_1 = credit_digest(sub_credits, nsub_s_g, sub_payee_0, sub_payee_1, g_squares, 1)
-        csp_0, csp_1 = child_sphincs_list_digest(sphincs_table, cover, base * nsub_x_g, xmss_slots_g, sphincs_slots_g, nsub_s_g, g_squares, sub_credits, credit_map, credits, nsub_p_g)
+        csp_0, csp_1 = child_sphincs_list_digest(sphincs_table, cover, base * nsub_x_g, xmss_slots_g, sphincs_slots_g, nsub_s_g, g_squares, sub_credits, credit_map, credits, nsub_p_g, sub_payees, payee_of)
         sub_run[GEN ** 2] = csp_0
         sub_run[GEN ** 3] = csp_1
         sub_set_0, sub_set_1 = signer_set_digest(sub_run, nsub_e_g, g_squares)
@@ -3706,6 +3757,21 @@ def main():
         defer_stmt[GEN ** DEFER_STMT_B_VALUE] = leaf_values[2]
     else:
         aggregate_claims(n_children_g, child_pi, child_fresh, child_carried, defer_stmt)
+
+    # ---- the overlap rule ----
+    # A claim covered more than once is credited to the occurrence with the least
+    # key (`credit_key`): each linked copy's key is at least its published slot's.
+    # Only in a node that omits nothing, where every other occurrence of a
+    # published claim is a linked copy; the statement's omitted count says which.
+    if n_somit_g == 1:
+        for xd in mul_range(1, n_slink_g):
+            idx = links[xd]
+            claim = sphincs_table * (idx ** 4)
+            prefix = StackBuf(2)
+            blake2s(claim[0:2], claim[2:4], prefix, counter=64)
+            key_pub = credit_key(prefix[0], prefix[1], payee_of[idx])
+            key_copy = credit_key(prefix[0], prefix[1], payee_of[n_sphincs_g * xd])
+            assert log(key_pub) < log(key_copy * GEN)
 
     cr_0, cr_1 = credit_digest(credits, n_sphincs_g, payee_0, payee_1, g_squares, 0)
     own_0, own_1 = statement_digest(seed_0, seed_1, signers_hash, da_0, da_1, cr_0, cr_1, n_somit_g, defer_stmt)

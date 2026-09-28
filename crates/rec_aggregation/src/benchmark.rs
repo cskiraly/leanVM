@@ -166,11 +166,15 @@ pub fn run_aggregation(n_xmss: usize, n_sphincs: usize, n_blobs: usize, log_inv_
 
 /// Prove `n` leaves with signatures and distinct blob payloads, then aggregate them in one
 /// recursion step and verify the result. The leaves are built once; only the
-/// recursion step is measured.
+/// recursion step is measured. With `sphincs_overlap` every leaf holds the same
+/// SPHINCS signatures under its own payee, so each claim reaches the node `n`
+/// times and the overlap rule compares every copy.
+#[allow(clippy::too_many_arguments)]
 pub fn run_recursion(
     n: usize,
     per_leaf: usize,
     sphincs_per_leaf: usize,
+    sphincs_overlap: bool,
     blobs_per_leaf: usize,
     log_inv_rate: usize,
     enable_tracing: bool,
@@ -191,7 +195,15 @@ pub fn run_recursion(
     );
     lean_vm::init_prover_pool();
     let all = signers(0, n * per_leaf);
-    let all_sphincs = sphincs_signers(0, n * sphincs_per_leaf);
+    let all_sphincs = sphincs_signers(
+        0,
+        if sphincs_overlap {
+            sphincs_per_leaf
+        } else {
+            n * sphincs_per_leaf
+        },
+    );
+    let sphincs_of = |k: usize| if sphincs_overlap { 0 } else { k * sphincs_per_leaf };
     let started = std::time::Instant::now();
     let guest_instructions = crate::aggregation::unified_guest().code_len();
     let compile_time = started.elapsed();
@@ -201,7 +213,7 @@ pub fn run_recursion(
             aggregate(
                 &[],
                 all[k * per_leaf..(k + 1) * per_leaf].to_vec(),
-                all_sphincs[k * sphincs_per_leaf..(k + 1) * sphincs_per_leaf].to_vec(),
+                all_sphincs[sphincs_of(k)..sphincs_of(k) + sphincs_per_leaf].to_vec(),
                 &blobs(blobs_per_leaf, k as u64),
                 None,
                 leaf_payee(k),
@@ -241,6 +253,9 @@ pub fn run_recursion(
     let mut inputs = Vec::new();
     if per_leaf > 0 || sphincs_per_leaf > 0 {
         inputs.push(format!("{} signatures", describe(per_leaf, sphincs_per_leaf)));
+    }
+    if sphincs_overlap && sphincs_per_leaf > 0 {
+        inputs.push("the same SPHINCS in every leaf".to_string());
     }
     if blobs_per_leaf > 0 {
         inputs.push(format!("{blobs_per_leaf} blobs"));
