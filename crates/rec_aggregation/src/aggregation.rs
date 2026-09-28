@@ -1903,7 +1903,8 @@ impl Coverage {
 }
 
 /// A claim takes its declared slot once; subsequent or omitted occurrences take
-/// fresh slots outside the hashed prefix.
+/// fresh slots outside the hashed prefix. First come is a policy: the guest accepts
+/// any occurrence in the declared slot, which for a SPHINCS claim decides its credit.
 fn take_slot<K: Ord + Clone>(claims: &[K], claimed: &mut [bool], duplicates: &mut Vec<K>, claim: &K) -> usize {
     match claims.binary_search(claim) {
         Ok(pos) if !claimed[pos] => {
@@ -2058,6 +2059,13 @@ fn plan_coverage(
 /// keeps its child's credit). The table is `payee`, then every other payee a
 /// declared claim credits, sorted: a child's payee that no declared claim names is
 /// dropped, its map entry 0.
+///
+/// Which occurrence of a claim covered more than once takes its declared slot is
+/// this host's policy ([`take_slot`]: raw first, then the children in order), not
+/// a guest rule: another prover may credit any occurrence it holds. Tightening it
+/// means a guest rule over the candidates, such as a fixed tie-break, the least
+/// `H(claim ‖ payee)`, or crediting every raw verifier (`doc/leanvm` §Checking
+/// coverage).
 fn plan_credits(
     cover: &Coverage,
     children: &[EthereumProof],

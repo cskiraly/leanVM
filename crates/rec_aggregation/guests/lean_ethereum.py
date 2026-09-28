@@ -3489,7 +3489,11 @@ def main():
     xmss_table = HeapBuf(xmss_slots_g * xmss_slots_g)
     sphincs_table = HeapBuf(sphincs_slots_g ** 4)
     # One credit a SPHINCS slot, written beside its coverage write, so exactly once;
-    # the declared prefix is what the credit digest hashes.
+    # the declared prefix is what the credit digest hashes. Which occurrence of a
+    # claim covered twice lands in its declared slot is the prover's choice (the
+    # "sp_raw_index" and "child_sphincs_index" hints), and so is that claim's
+    # credit. A rule over the candidates would link each duplicate slot to its
+    # declared claim and compare the two here.
     credits = HeapBuf(sphincs_slots_g)
     # The run the set's hash covers: both lengths and the SPHINCS list's digest
     # in one block, then two a group. Eight cells a group, so a group's
