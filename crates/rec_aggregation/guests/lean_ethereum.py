@@ -2501,11 +2501,12 @@ def verify_sig_sphincs(signer):
 # =========================== statements and the signer set ==========================
 
 
-def statement_digest(seed_0, seed_1, signers_hash, da_0, da_1, cr_0, cr_1, defer):
+def statement_digest(seed_0, seed_1, signers_hash, da_0, da_1, cr_0, cr_1, omitted_g, defer):
     # A node's statement, hashed to the two words the VM publishes, over the
     # proving environment's Fiat-Shamir seed (flock's R1CS and this bytecode), the
     # two-cell signer-set digest, the digest of its possibly empty DA root list,
-    # its credit digest, and the DEFER_STMT_CELLS deferred-claim cells. A
+    # its credit digest, g^(its omitted SPHINCS slots), and the DEFER_STMT_CELLS
+    # deferred-claim cells. A
     # parent rebuilds a child's statement with this same call, over a signer-set
     # digest it re-absorbed itself, which forces the child to be a proof of THIS
     # bytecode over groups checked against the parent's own.
@@ -2524,6 +2525,7 @@ def statement_digest(seed_0, seed_1, signers_hash, da_0, da_1, cr_0, cr_1, defer
     cells[5] = da_1
     cells[6] = cr_0
     cells[7] = cr_1
+    cells[8] = omitted_g
     for p in unroll(0, STMT_PAIRS):
         s = defer[GEN ** (2 * p)]
         if const(2 * p + 1 == DEFER_STMT_CELLS):
@@ -3368,21 +3370,25 @@ def main():
     # what makes the statement's split mean which scheme verified which key against
     # which (epoch, message). An XMSS slot is two cells, a SPHINCS slot four: a key
     # and the message that key signed. A DA root occupies two cells.
-    meta = StackBuf(7)
+    meta = StackBuf(8)
     hint_witness(meta, "meta")  # every count in the exponent
     n_decl_g = meta[0]
     n_drop_g = meta[1]
     n_sphincs_g = meta[2]
-    n_sdup_g = meta[3]
-    n_raw_s_g = meta[4]
-    n_children_g = meta[5]
-    n_direct_da_g = meta[6]
+    n_slink_g = meta[3]
+    n_somit_g = meta[4]
+    n_raw_s_g = meta[5]
+    n_children_g = meta[6]
+    n_direct_da_g = meta[7]
     # Declared plus dropped, so bounding each side pins n_decl <= n_epochs.
     assert log(n_decl_g) < MAX_EPOCHS + 1
     assert log(n_drop_g) < MAX_EPOCHS + 1
     n_epochs_g = n_decl_g * n_drop_g
     assert log(n_epochs_g) < MAX_EPOCHS + 1
     assert log(n_sphincs_g) < MAX_KEYS
+    assert log(n_slink_g) < MAX_KEYS
+    assert log(n_somit_g) < MAX_KEYS
+    n_sdup_g = n_slink_g * n_somit_g
     assert log(n_sdup_g) < MAX_KEYS
     assert log(n_raw_s_g) < MAX_KEYS
     assert log(n_children_g) < MAX_RECURSIONS + 1
@@ -3492,8 +3498,8 @@ def main():
     # the declared prefix is what the credit digest hashes. Which occurrence of a
     # claim covered twice lands in its declared slot is the prover's choice (the
     # "sp_raw_index" and "child_sphincs_index" hints), and so is that claim's
-    # credit. A rule over the candidates would link each duplicate slot to its
-    # declared claim and compare the two here.
+    # credit. The linked copies below tie each other occurrence of a declared
+    # claim to its slot, which is what a rule over the candidates compares.
     credits = HeapBuf(sphincs_slots_g)
     # The run the set's hash covers: both lengths and the SPHINCS list's digest
     # in one block, then two a group. Eight cells a group, so a group's
@@ -3541,8 +3547,23 @@ def main():
     signers_hash = HeapBuf(WORDS_PER_BLOCK)
     signers_hash[1] = set_0
     signers_hash[GEN] = set_1
-    for xd in mul_range(1, n_sdup_g):
+    # The SPHINCS duplicate slots are [linked copies | omitted]. A linked copy is a
+    # second occurrence of a declared claim, its four cells copied from the declared
+    # slot a hinted index names. The omitted slots hold claims this node covers and
+    # does not publish; the statement carries their count, and a copy of a declared
+    # claim may hide there too, so only a statement that omits nothing says every
+    # other occurrence of a declared claim is linked to it.
+    for xd in mul_range(1, n_slink_g):
+        idx = hint_witness("sphincs_link")
+        assert log(idx) < log(n_sphincs_g)
         dup = sphincs_table * ((n_sphincs_g * xd) ** 4)
+        linked = sphincs_table * (idx ** 4)
+        dup[1] = linked[1]
+        dup[GEN] = linked[GEN]
+        dup[GEN ** 2] = linked[GEN ** 2]
+        dup[GEN ** 3] = linked[GEN ** 3]
+    for xd in mul_range(1, n_somit_g):
+        dup = sphincs_table * ((n_sphincs_g * n_slink_g * xd) ** 4)
         hint_witness(dup[0:4], "dup_sphincs")
 
     # ---- coverage ----
@@ -3657,7 +3678,9 @@ def main():
             root[GEN ** 2] = vector_0
             root[GEN ** 3] = vector_1
         child_da_0, child_da_1 = da_list_digest(child_da, nsub_da_g)
-        pi_0, pi_1 = statement_digest(seed_0, seed_1, sub_hash, child_da_0, child_da_1, sub_cr_0, sub_cr_1, carried)
+        # Only rebuilt: nothing here depends on whether the child omitted.
+        sub_omitted_g = hint_witness("child_omitted")
+        pi_0, pi_1 = statement_digest(seed_0, seed_1, sub_hash, child_da_0, child_da_1, sub_cr_0, sub_cr_1, sub_omitted_g, carried)
         pi = xc * xc
         child_pi[pi] = pi_0
         child_pi[pi * GEN] = pi_1
@@ -3685,7 +3708,7 @@ def main():
         aggregate_claims(n_children_g, child_pi, child_fresh, child_carried, defer_stmt)
 
     cr_0, cr_1 = credit_digest(credits, n_sphincs_g, payee_0, payee_1, g_squares, 0)
-    own_0, own_1 = statement_digest(seed_0, seed_1, signers_hash, da_0, da_1, cr_0, cr_1, defer_stmt)
+    own_0, own_1 = statement_digest(seed_0, seed_1, signers_hash, da_0, da_1, cr_0, cr_1, n_somit_g, defer_stmt)
     pub_ptr = GEN ** 0
     assert pub_ptr[1] == own_0
     assert pub_ptr[GEN] == own_1

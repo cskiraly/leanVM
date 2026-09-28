@@ -425,9 +425,9 @@ impl DeferredClaim {
 
 /// The statement's fixed header, ahead of the deferred cells: the seed, the
 /// signer-set digest (which itself binds the epoch groups and every count), the
-/// DA root-list digest, and the credit digest. Fed to the guest as `STMT_HEADER`,
-/// so the two cannot drift.
-const STATEMENT_HEADER: usize = 8;
+/// DA root-list digest, the credit digest, and the omitted SPHINCS slot count (in
+/// the exponent). Fed to the guest as `STMT_HEADER`, so the two cannot drift.
+const STATEMENT_HEADER: usize = 9;
 
 /// A plain BLAKE2s over a lane stream, zero-filled to a whole 64-byte block:
 /// what the guest gets by streaming four 128-bit cells a block.
@@ -453,6 +453,7 @@ fn statement_digest(
     signers_hash: [F192; 2],
     da_digest: [u8; 32],
     credit_digest: [F192; 2],
+    sphincs_omitted: u16,
     defer: &DeferredClaim,
 ) -> [F192; 2] {
     let seed = lean_vm::cpu::fs_seed(unified_guest());
@@ -466,6 +467,7 @@ fn statement_digest(
         da_digest[1],
         credit_digest[0],
         credit_digest[1],
+        count(sphincs_omitted.into()),
     ];
     assert_eq!(header.len(), STATEMENT_HEADER);
     let mut cells = defer.cells();
@@ -528,6 +530,8 @@ pub struct EthereumProof {
     /// One index into [`Self::payees`] per SPHINCS claim, aligned with
     /// [`Self::sphincs_signers`]: who verified that claim raw.
     sphincs_credits: Vec<u16>,
+    /// How many SPHINCS claims the last fold covered without publishing them.
+    sphincs_omitted: u16,
     /// What this aggregate defers to whoever discharges it: its parent, in
     /// circuit, or [`Self::verify`], natively.
     defer: DeferredClaim,
@@ -652,6 +656,7 @@ impl std::error::Error for AggregationError {
 type WireCore = (
     Vec<Payee>,
     Vec<u16>,
+    u16,
     Vec<[u8; 32]>,
     Vec<F192>,
     Vec<F192>,
@@ -753,6 +758,7 @@ impl EthereumProof {
             signers_hash(&self.xmss_signers, &self.sphincs_signers),
             self.da_commitments_digest(),
             credit_digest(&self.payees, &self.sphincs_credits),
+            self.sphincs_omitted,
             &self.defer,
         )
     }
@@ -773,6 +779,15 @@ impl EthereumProof {
     /// The payee credited for [`Self::sphincs_signers`]`[i]`.
     pub fn sphincs_payee(&self, i: usize) -> &Payee {
         &self.payees[usize::from(self.sphincs_credits[i])]
+    }
+
+    /// How many SPHINCS coverage slots the fold that produced this aggregate filled
+    /// with claims it does not publish (a claim dropped, or a second copy it chose
+    /// not to link to its published slot). Zero means every other occurrence of a
+    /// published claim that fold held is linked to it, which is what a rule over a
+    /// claim's candidate credits needs. It says nothing of the folds below.
+    pub fn sphincs_omitted(&self) -> u16 {
+        self.sphincs_omitted
     }
 
     /// Strictly increasing `(epoch, message)` pairs, each group non-empty and
@@ -810,7 +825,7 @@ impl EthereumProof {
     }
 
     /// The wire format: the signer set (each group with its epoch and
-    /// message), the payee table and credits, the DA root list, the two deferred points, and the VM proof. The claim *values* are not transmitted;
+    /// message), the payee table and credits, the omitted count, the DA root list, the two deferred points, and the VM proof. The claim *values* are not transmitted;
     /// [`Self::from_bytes`] recomputes them, so there is nothing to lie about.
     pub fn to_bytes(&self) -> Vec<u8> {
         wire()
@@ -848,10 +863,21 @@ impl EthereumProof {
     }
 
     #[allow(clippy::type_complexity)]
-    fn core(&self) -> (&[Payee], &[u16], &[[u8; 32]], &[F192], &[F192], &lean_vm::cpu::Proof) {
+    fn core(
+        &self,
+    ) -> (
+        &[Payee],
+        &[u16],
+        u16,
+        &[[u8; 32]],
+        &[F192],
+        &[F192],
+        &lean_vm::cpu::Proof,
+    ) {
         (
             &self.payees,
             &self.sphincs_credits,
+            self.sphincs_omitted,
             &self.da_roots,
             &self.defer.bytecode_point,
             &self.defer.matrix_point,
@@ -864,7 +890,7 @@ impl EthereumProof {
             xmss: xmss_signers,
             sphincs: sphincs_signers,
         } = keys;
-        let (payees, sphincs_credits, da_roots, bytecode_point, matrix_point, proof) = core;
+        let (payees, sphincs_credits, sphincs_omitted, da_roots, bytecode_point, matrix_point, proof) = core;
         // Cheap rejections first. `recompute` below is a pass over the whole stacked
         // bytecode plus a walk of the BLAKE2s circuit, on points a peer chose, so
         // anything decidable without it has to be decided before it.
@@ -877,6 +903,7 @@ impl EthereumProof {
             da_roots,
             payees,
             sphincs_credits,
+            sphincs_omitted,
             // The wire carries no value, only the points to derive it from.
             defer: DeferredClaim::recompute(bytecode_point, matrix_point)?,
             proof,
@@ -1874,7 +1901,11 @@ struct Coverage {
     /// One duplicate list per group, aligned with `xmss_groups`.
     xmss_dups: Vec<Vec<XmssPublicKey>>,
     sphincs_signers: Vec<SphincsClaim>,
-    sphincs_dups: Vec<SphincsClaim>,
+    /// The SPHINCS duplicate slots, `[linked | omitted]`: per linked copy, the
+    /// declared claim it is a second occurrence of; then the claims covered and not
+    /// published, one slot an occurrence.
+    sphincs_links: Vec<usize>,
+    sphincs_omitted: Vec<SphincsClaim>,
     /// Offsets within each raw signature's own group region, indexed as `raw_xmss`.
     raw_xmss: Vec<usize>,
     /// `raw_xmss` indices in the guest's walk order: it walks the table, whose
@@ -1898,7 +1929,10 @@ impl Coverage {
     }
 
     fn n_total(&self) -> usize {
-        self.n_keys() + self.xmss_dups.iter().map(Vec::len).sum::<usize>() + self.sphincs_dups.len()
+        self.n_keys()
+            + self.xmss_dups.iter().map(Vec::len).sum::<usize>()
+            + self.sphincs_links.len()
+            + self.sphincs_omitted.len()
     }
 }
 
@@ -1914,6 +1948,34 @@ fn take_slot<K: Ord + Clone>(claims: &[K], claimed: &mut [bool], duplicates: &mu
         _ => {
             duplicates.push(claim.clone());
             claims.len() + duplicates.len() - 1
+        }
+    }
+}
+
+/// [`take_slot`] for the SPHINCS region, whose duplicate slots are split: a
+/// later occurrence of a declared claim takes the next of the `n_links` linked
+/// slots right after the declared ones, recording which claim it copies, and an
+/// occurrence of an undeclared claim the next omitted slot after those.
+fn take_sphincs_slot(
+    claims: &[SphincsClaim],
+    claimed: &mut [bool],
+    links: &mut Vec<usize>,
+    n_links: usize,
+    omitted: &mut Vec<SphincsClaim>,
+    claim: &SphincsClaim,
+) -> usize {
+    match claims.binary_search(claim) {
+        Ok(pos) if !claimed[pos] => {
+            claimed[pos] = true;
+            pos
+        }
+        Ok(pos) => {
+            links.push(pos);
+            claims.len() + links.len() - 1
+        }
+        Err(_) => {
+            omitted.push(*claim);
+            claims.len() + n_links + omitted.len() - 1
         }
     }
 }
@@ -1995,7 +2057,26 @@ fn plan_coverage(
     let mut xmss_claimed: Vec<Vec<bool>> = xmss_groups.iter().map(|group| vec![false; group.keys.len()]).collect();
     let mut xmss_dups: Vec<Vec<XmssPublicKey>> = vec![Vec::new(); xmss_groups.len()];
     let mut sphincs_claimed = vec![false; sphincs_signers.len()];
-    let mut sphincs_dups = Vec::new();
+    // Every declared claim occurs at least once, so the rest of their occurrences
+    // are the linked copies, which go ahead of the omitted slots.
+    let n_links = raw_sphincs
+        .iter()
+        .chain(children.iter().flat_map(|child| &child.sphincs_signers))
+        .filter(|signer| sphincs_signers.binary_search(signer).is_ok())
+        .count()
+        - sphincs_signers.len();
+    let mut sphincs_links = Vec::with_capacity(n_links);
+    let mut sphincs_omitted = Vec::new();
+    let mut take_sphincs = |signer: &SphincsClaim| {
+        take_sphincs_slot(
+            &sphincs_signers,
+            &mut sphincs_claimed,
+            &mut sphincs_links,
+            n_links,
+            &mut sphincs_omitted,
+            signer,
+        )
+    };
     let raw_xmss_slots: Vec<usize> = raw_xmss
         .iter()
         .map(|(pk, epoch, message)| {
@@ -2003,10 +2084,7 @@ fn plan_coverage(
             take_slot(&xmss_groups[g].keys, &mut xmss_claimed[g], &mut xmss_dups[g], pk)
         })
         .collect();
-    let raw_sphincs_slots: Vec<usize> = raw_sphincs
-        .iter()
-        .map(|signer| take_slot(&sphincs_signers, &mut sphincs_claimed, &mut sphincs_dups, signer))
-        .collect();
+    let raw_sphincs_slots: Vec<usize> = raw_sphincs.iter().map(&mut take_sphincs).collect();
     let mut child_xmss = Vec::with_capacity(children.len());
     let mut child_sphincs = Vec::with_capacity(children.len());
     for child in children {
@@ -2025,13 +2103,7 @@ fn plan_coverage(
                 })
                 .collect::<Vec<(usize, Vec<usize>)>>(),
         );
-        child_sphincs.push(
-            child
-                .sphincs_signers
-                .iter()
-                .map(|signer| take_slot(&sphincs_signers, &mut sphincs_claimed, &mut sphincs_dups, signer))
-                .collect(),
-        );
+        child_sphincs.push(child.sphincs_signers.iter().map(&mut take_sphincs).collect());
     }
     // Stable, so signatures within a group keep the order their slots were taken in.
     let mut raw_walk: Vec<usize> = (0..raw_xmss.len()).collect();
@@ -2041,7 +2113,8 @@ fn plan_coverage(
         n_declared,
         xmss_dups,
         sphincs_signers,
-        sphincs_dups,
+        sphincs_links,
+        sphincs_omitted,
         raw_xmss: raw_xmss_slots,
         raw_walk,
         raw_sphincs: raw_sphincs_slots,
@@ -2255,7 +2328,7 @@ pub(crate) fn aggregate_with_stats(
         da_input,
         payee,
         log_inv_rate,
-        |_, _, _| {},
+        |_, _, _, _| {},
     )
 }
 
@@ -2265,8 +2338,9 @@ pub(crate) fn aggregate_with_stats(
 /// asserts over prover advice, so the only way to test them is to lie in a hint
 /// and require the guest to notice. That is what `tamper` is for
 /// (`aggregate_hints_bind`); with an empty hook this is the production path. It
-/// also gets the payee table and credits the statement will publish, since a lie
-/// about a credit only means something when the statement tells the same lie.
+/// also gets the payee table, credits and omitted count the statement will
+/// publish, since a lie about those only means something when the statement tells
+/// the same lie.
 pub(crate) fn aggregate_tampered(
     children: &[EthereumProof],
     raw_xmss: Vec<(XmssPublicKey, xmss::Epoch, xmss::Message, XmssSignature)>,
@@ -2275,7 +2349,7 @@ pub(crate) fn aggregate_tampered(
     da_input: DaInput<'_>,
     payee: Payee,
     log_inv_rate: usize,
-    tamper: impl FnOnce(&mut Hints, &mut Vec<Payee>, &mut Vec<u16>),
+    tamper: impl FnOnce(&mut Hints, &mut Vec<Payee>, &mut Vec<u16>, &mut u16),
 ) -> Result<(EthereumProof, lean_vm::cpu::Stats), AggregationError> {
     // Otherwise this reaches `cpu::prove`, which asserts rather than reporting.
     if !(lean_vm::pcs::MIN_LOG_INV_RATE..=lean_vm::pcs::MAX_LOG_INV_RATE).contains(&log_inv_rate) {
@@ -2365,7 +2439,8 @@ pub(crate) fn aggregate_tampered(
             count(cover.n_declared),
             count(cover.xmss_groups.len() - cover.n_declared),
             count(n_sphincs),
-            count(cover.sphincs_dups.len()),
+            count(cover.sphincs_links.len()),
+            count(cover.sphincs_omitted.len()),
             count(raw_sphincs.len()),
             count(children.len()),
             count(usize::from(!rows.is_empty())),
@@ -2417,7 +2492,10 @@ pub(crate) fn aggregate_tampered(
     for signer in &cover.sphincs_signers {
         hints.push("sphincs_signers", sphincs_signer_cells(signer).to_vec());
     }
-    for signer in &cover.sphincs_dups {
+    for &pos in &cover.sphincs_links {
+        hints.push("sphincs_link", vec![count(pos)]);
+    }
+    for signer in &cover.sphincs_omitted {
         hints.push("dup_sphincs", sphincs_signer_cells(signer).to_vec());
     }
     // Group-major over the table, not over the epochs `raw_xmss` is sorted by: a
@@ -2472,6 +2550,7 @@ pub(crate) fn aggregate_tampered(
         hints.push("signers_split", signers_split(1 + 2 * child.xmss_signers.len()));
         hints.push("child_defer", child.defer.cells());
         hints.push("child_da_count", vec![count(child.da_roots.len())]);
+        hints.push("child_omitted", vec![count(child.sphincs_omitted.into())]);
         let (sub_hints, defer) = gen_verify(guest, pi, summary)?;
         for (name, entry) in sub_hints {
             hints.push(name, entry);
@@ -2563,11 +2642,13 @@ pub(crate) fn aggregate_tampered(
         hints.push("da_roots", da_claim_cells(root));
     }
 
-    tamper(&mut hints, &mut payees, &mut sphincs_credits);
+    let mut sphincs_omitted = u16::try_from(cover.sphincs_omitted.len()).expect("below MAX_KEYS");
+    tamper(&mut hints, &mut payees, &mut sphincs_credits, &mut sphincs_omitted);
     let public_input = statement_digest(
         signers_hash(cover.declared(), &cover.sphincs_signers),
         da_list_digest(&da_roots),
         credit_digest(&payees, &sphincs_credits),
+        sphincs_omitted,
         &defer,
     );
     let mut program = guest.clone();
@@ -2584,6 +2665,7 @@ pub(crate) fn aggregate_tampered(
             da_roots,
             payees,
             sphincs_credits,
+            sphincs_omitted,
             defer,
             proof,
         },
@@ -4087,7 +4169,7 @@ def main():
                 },
                 PAYEE,
                 LOG_INV_RATE,
-                |h, _, _| {
+                |h, _, _, _| {
                     h.entries("da_index")[0] = vec![index];
                 },
             );
@@ -4101,7 +4183,7 @@ def main():
             DaInput::default(),
             PAYEE,
             LOG_INV_RATE,
-            |h, _, _| {
+            |h, _, _, _| {
                 h.entries("da_index")[1] = h.entries("da_index")[0].clone();
             },
         );
@@ -4123,7 +4205,7 @@ def main():
                 },
                 PAYEE,
                 LOG_INV_RATE,
-                |h, _, _| {
+                |h, _, _, _| {
                     h.entries("da_meta")[0] = vec![count(declared), count(duplicates)];
                     h.entries("da_roots").push(da_claim_cells(&second));
                 },
@@ -4142,7 +4224,7 @@ def main():
                 },
                 PAYEE,
                 LOG_INV_RATE,
-                |h, _, _| {
+                |h, _, _, _| {
                     let root = h
                         .entries("da_roots")
                         .iter_mut()
@@ -4165,7 +4247,7 @@ def main():
                 },
                 PAYEE,
                 LOG_INV_RATE,
-                |h, _, _| {
+                |h, _, _, _| {
                     let omitted = h
                         .entries("da_roots")
                         .iter_mut()
@@ -5106,6 +5188,8 @@ def main():
         tampered(&|s| {
             s.sphincs_credits.pop();
         });
+        // The node omits nothing; claiming it did, or the reverse, is a statement lie.
+        tampered(&|s| s.sphincs_omitted = 1);
         tampered(&|s| s.xmss_signers[0].keys[0] = get_signers(2 * SMALL_LEAF_SIZE + 1)[2 * SMALL_LEAF_SIZE].0.clone());
         // Splitting one group's keys across two epochs: the same claims cannot
         // be re-attributed to an epoch nothing signed at.
@@ -5154,7 +5238,7 @@ def main():
 
     type Tamper<'a> = (&'a str, &'a dyn Fn(&mut Hints));
     /// A hook that may also lie about the payee table and credits published.
-    type CreditHook<'a> = &'a dyn Fn(&mut Hints, &mut Vec<Payee>, &mut Vec<u16>);
+    type CreditHook<'a> = &'a dyn Fn(&mut Hints, &mut Vec<Payee>, &mut Vec<u16>, &mut u16);
 
     /// Corrupt each security-critical hint and require rejection.
     #[test]
@@ -5173,7 +5257,7 @@ def main():
                     DaInput::default(),
                     PAYEE,
                     LOG_INV_RATE,
-                    |hints, payees, credits| tamper(hints, payees, credits),
+                    |hints, payees, credits, omitted| tamper(hints, payees, credits, omitted),
                 )
                 .map(|(signature, _)| signature.verify().is_ok());
                 assert!(!matches!(outcome, Ok(true)), "tampering {description} must be rejected");
@@ -5191,7 +5275,7 @@ def main():
                 DaInput::default(),
                 PAYEE,
                 LOG_INV_RATE,
-                |hints, _, _| tamper(hints),
+                |hints, _, _, _| tamper(hints),
             )
             .map(|(signature, _)| signature.verify().is_ok());
             assert!(!matches!(outcome, Ok(true)), "tampering {description} must be rejected");
@@ -5326,10 +5410,10 @@ def main():
                 entries[1] = entries[0].clone();
             }),
             ("meta (n_sphincs inflated)", &|h: &mut Hints| {
-                h.entries("meta")[0][1] = count(3);
+                h.entries("meta")[0][2] = count(3);
             }),
             ("meta (n_raw_sphincs understated)", &|h: &mut Hints| {
-                h.entries("meta")[0][3] = count(1);
+                h.entries("meta")[0][5] = count(1);
             }),
             ("sphincs_signers (a message nobody signed)", &|h: &mut Hints| {
                 h.entries("sphincs_signers")[0][2] += F192::ONE;
@@ -5560,45 +5644,51 @@ def main():
         };
         let credit_cases: &[(&str, CreditHook)] = &[
             // Rule 1: a raw signature credits this node and no one else.
-            ("credits (a raw claim credited to a child's payee)", &|_, _, c| {
+            ("credits (a raw claim credited to a child's payee)", &|_, _, c, _| {
                 relabel(c, 0, 1)
             }),
             // Rule 2: a child's claim keeps its child's credit.
-            ("credits (a child's claim credited to this node)", &|_, _, c| {
+            ("credits (a child's claim credited to this node)", &|_, _, c, _| {
                 relabel(c, 1, 0)
             }),
-            ("credit_map (a child's payee mapped to this node's own)", &|h, _, c| {
-                relabel(c, 1, 0);
-                h.entries("credit_map")[0] = vec![count(0)];
-            }),
-            ("credit_map (one child's payee mapped to the other's)", &|h, _, c| {
+            (
+                "credit_map (a child's payee mapped to this node's own)",
+                &|h, _, c, _| {
+                    relabel(c, 1, 0);
+                    h.entries("credit_map")[0] = vec![count(0)];
+                },
+            ),
+            ("credit_map (one child's payee mapped to the other's)", &|h, _, c, _| {
                 relabel(c, 1, 2);
                 h.entries("credit_map")[0] = vec![count(2)];
             }),
-            ("credit_map (a payee this node keeps, dropped)", &|h, _, _| {
+            ("credit_map (a payee this node keeps, dropped)", &|h, _, _, _| {
                 h.entries("credit_map")[0] = vec![F192::ZERO];
             }),
             // The table entry a child's payee maps to, renamed to one of this
             // node's choosing: the map compares addresses, not indices.
-            ("payees (a child's payee renamed in this node's table)", &|h, p, _| {
-                let renamed: Payee = [0xa0; 20];
-                p[1] = renamed;
-                h.entries("credit_cells")[0][2..4].copy_from_slice(&payee_cells(&renamed));
-            }),
+            (
+                "payees (a child's payee renamed in this node's table)",
+                &|h, p, _, _| {
+                    let renamed: Payee = [0xa0; 20];
+                    p[1] = renamed;
+                    h.entries("credit_cells")[0][2..4].copy_from_slice(&payee_cells(&renamed));
+                },
+            ),
             // The range and address checks, reached by a child's credit past its
             // table and by a child payee this node's table does not hold. Stream
             // order: this node's table (two entries), then per child its table
             // and its credits.
-            ("credit_cells (a child's credit past its table)", &|h, _, _| {
+            ("credit_cells (a child's credit past its table)", &|h, _, _, _| {
                 h.entries("credit_cells")[3][0] = count(1);
             }),
-            ("credit_cells (a child's payee)", &|h, _, _| {
+            ("credit_cells (a child's payee)", &|h, _, _, _| {
                 h.entries("credit_cells")[2][0] += F192::ONE;
             }),
-            ("child_payees (a child's table cut short)", &|h, _, _| {
+            ("child_payees (a child's table cut short)", &|h, _, _, _| {
                 h.entries("child_payees")[0] = vec![count(0)];
             }),
-            ("credit_split (a last block past the run)", &|h, _, _| {
+            ("credit_split (a last block past the run)", &|h, _, _, _| {
                 h.entries("credit_split")[0][2] = count(3);
             }),
         ];
@@ -5630,18 +5720,24 @@ def main():
         let child_cases: &[(&str, CreditHook)] = &[
             // Stream order: this node's table (two entries), the child's (one), then
             // the child's credits. Claim 0 is the same claim in both lists.
-            ("credit_cells (a child's claim moved to its other payee)", &|h, p, c| {
-                let cell = &mut h.entries("credit_cells")[3][0];
-                let moved = usize::from(*cell == count(0));
-                *cell = count(moved);
-                c[0] = p.iter().position(|q| *q == child_payees[moved]).expect("in the table") as u16;
-            }),
-            ("credit_cells (a child's payee renamed in both tables)", &|h, p, _| {
-                let renamed: Payee = [0xa7; 20];
-                p[1] = renamed;
-                h.entries("credit_cells")[0][2..4].copy_from_slice(&payee_cells(&renamed));
-                h.entries("credit_cells")[2][2..4].copy_from_slice(&payee_cells(&renamed));
-            }),
+            (
+                "credit_cells (a child's claim moved to its other payee)",
+                &|h, p, c, _| {
+                    let cell = &mut h.entries("credit_cells")[3][0];
+                    let moved = usize::from(*cell == count(0));
+                    *cell = count(moved);
+                    c[0] = p.iter().position(|q| *q == child_payees[moved]).expect("in the table") as u16;
+                },
+            ),
+            (
+                "credit_cells (a child's payee renamed in both tables)",
+                &|h, p, _, _| {
+                    let renamed: Payee = [0xa7; 20];
+                    p[1] = renamed;
+                    h.entries("credit_cells")[0][2..4].copy_from_slice(&payee_cells(&renamed));
+                    h.entries("credit_cells")[2][2..4].copy_from_slice(&payee_cells(&renamed));
+                },
+            ),
         ];
         for (description, tamper) in child_cases {
             rejects_credits(&child, vec![], description, *tamper);
@@ -5715,6 +5811,7 @@ def main():
         let raw = vec![claims[1].clone(), claims[5].clone()];
         let node = aggregate(&[a, b], vec![], raw, &[], None, N, LOG_INV_RATE).expect("node aggregates");
         node.verify().expect("node verifies");
+        assert_eq!(node.sphincs_omitted(), 0, "every copy is linked to its claim");
         assert_eq!(node.payees, [N, A, B]);
         assert_eq!(
             credited(&node),
@@ -5734,6 +5831,11 @@ def main():
         let narrowed =
             aggregate(&[node], vec![], vec![], &[], Some(selection), M, LOG_INV_RATE).expect("narrowed aggregates");
         narrowed.verify().expect("narrowed verifies");
+        assert_eq!(
+            narrowed.sphincs_omitted(),
+            4,
+            "claims 0, 1, 2 and 5 are covered, not published"
+        );
         assert_eq!(narrowed.payees, [M, B]);
         assert_eq!(credited(&narrowed), expected(&[(3, B), (4, B)]));
 
@@ -5741,8 +5843,85 @@ def main():
         let again = aggregate(&[narrowed], vec![], vec![claims[0].clone()], &[], None, M, LOG_INV_RATE)
             .expect("the next fold aggregates");
         again.verify().expect("the next fold verifies");
+        assert_eq!(again.sphincs_omitted(), 0, "its child's omissions are not its own");
         assert_eq!(again.payees, [M, B]);
         assert_eq!(credited(&again), expected(&[(0, M), (3, B), (4, B)]));
+    }
+
+    /// A second occurrence of a published SPHINCS claim sits in a linked slot, a
+    /// copy of the published slot it names; the claims a node covers and does not
+    /// publish sit in the omitted slots after them, and the statement carries how
+    /// many. A copy may still be put among the omitted, but only by saying so.
+    #[test]
+    fn sphincs_copies_link_to_their_claim() {
+        lean_vm::init_prover_pool();
+        const A: Payee = [0xa1; 20];
+        const B: Payee = [0xb2; 20];
+        let claims = get_sphincs_signers(3);
+        let leaf = |range: std::ops::Range<usize>, payee: Payee| {
+            aggregate(&[], vec![], claims[range].to_vec(), &[], None, payee, LOG_INV_RATE).expect("leaf aggregates")
+        };
+        // Claim 1 arrives three times: raw, then under each child, so it takes its
+        // published slot and two linked ones.
+        let children = [leaf(0..2, A), leaf(1..3, B)];
+        let raw = vec![claims[1].clone()];
+        let copied = (claims[1].0, claims[1].1);
+        type LinkHook<'a> = &'a dyn Fn(&mut Hints, &mut u16);
+        let outcome = |tamper: LinkHook| {
+            aggregate_tampered(
+                &children,
+                vec![],
+                raw.clone(),
+                None,
+                DaInput::default(),
+                PAYEE,
+                LOG_INV_RATE,
+                |h, _, _, omitted| tamper(h, omitted),
+            )
+            .map(|(proof, _)| (proof.verify().is_ok(), proof.sphincs_omitted()))
+        };
+        assert_eq!(outcome(&|_, _| {}), Ok((true, 0)), "the honest node");
+
+        let rejected: &[(&str, LinkHook)] = &[
+            ("sphincs_link (a copy of another published claim)", &|h, _| {
+                let other = count(usize::from(h.entries("sphincs_link")[0][0] == count(0)));
+                h.entries("sphincs_link")[0] = vec![other];
+            }),
+            // The second copy names the first, which holds the same cells: only the
+            // bound keeps a link on the published prefix.
+            ("sphincs_link (a copy of a copy)", &|h, _| {
+                h.entries("sphincs_link")[1] = vec![count(3)];
+            }),
+            ("the omitted count (one where there is none)", &|_, omitted| {
+                *omitted = 1
+            }),
+            // The last linked slot is the first omitted one, so a copy moves there
+            // without changing any coverage index: allowed, but not silently.
+            ("meta (a copy moved among the omitted, not published)", &|h, _| {
+                h.entries("sphincs_link").pop();
+                h.entries("meta")[0][3] = count(1);
+                h.entries("meta")[0][4] = count(1);
+                h.push("dup_sphincs", sphincs_signer_cells(&copied).to_vec());
+            }),
+        ];
+        for (description, tamper) in rejected {
+            assert!(
+                !matches!(outcome(tamper), Ok((true, _))),
+                "tampering {description} must be rejected"
+            );
+        }
+        let moved = |h: &mut Hints, omitted: &mut u16| {
+            h.entries("sphincs_link").pop();
+            h.entries("meta")[0][3] = count(1);
+            h.entries("meta")[0][4] = count(1);
+            h.push("dup_sphincs", sphincs_signer_cells(&copied).to_vec());
+            *omitted = 1;
+        };
+        assert_eq!(
+            outcome(&moved),
+            Ok((true, 1)),
+            "a copy among the omitted, published as one"
+        );
     }
 
     #[test]
