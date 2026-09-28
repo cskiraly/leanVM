@@ -335,6 +335,17 @@ fn credit_key(claim: &SphincsClaim, payee: &Payee) -> CreditKey {
     lane_key(F64(u64::from_le_bytes(digest[..8].try_into().expect("8 bytes"))))
 }
 
+/// The non-membership key of a claim, as the guest's `claim_key` computes it: the
+/// norm key ([`lane_key`]) of the first lane of `BLAKE2s(claim)`, its 64 bytes.
+fn claim_key(claim: &SphincsClaim) -> CreditKey {
+    cells_key(sphincs_signer_cells(claim))
+}
+
+fn cells_key(cells: [F192; 4]) -> CreditKey {
+    let digest = primitives::hash::hash(&cell_bytes(cells));
+    lane_key(F64(u64::from_le_bytes(digest[..8].try_into().expect("8 bytes"))))
+}
+
 fn lane_key(lane: F64) -> CreditKey {
     if lane.is_zero() {
         return CreditKey { key: 0, root: F64::ONE };
@@ -2250,6 +2261,45 @@ fn plan_credits(
     Ok((payees, credited.iter().map(|p| index[p]).collect()))
 }
 
+fn push_key(hints: &mut Hints, k: &CreditKey) {
+    hints.push("credit_key", vec![count(k.key)]);
+    hints.push("credit_key_root", vec![F192::from(k.root)]);
+}
+
+/// The guest's non-membership pass (`sort_published`, `absent`), run only when the
+/// node omits a SPHINCS claim: the published claims in key order (ties by list
+/// position), each with its key, then per omitted claim its key, how many published
+/// keys are smaller and how many equal, and for each equal one a cell where the two
+/// claims differ. Its keys lead the key stream, ahead of the overlap rule's.
+fn push_absence_hints(hints: &mut Hints, published: &[SphincsClaim], omitted: &[SphincsClaim]) {
+    if omitted.is_empty() {
+        return;
+    }
+    let keys: Vec<CreditKey> = published.iter().map(claim_key).collect();
+    let mut order: Vec<usize> = (0..published.len()).collect();
+    order.sort_by_key(|&i| (keys[i].key, i));
+    for &i in &order {
+        hints.push("sphincs_order", vec![count(i)]);
+        push_key(hints, &keys[i]);
+    }
+    for claim in omitted {
+        let k = claim_key(claim);
+        push_key(hints, &k);
+        let below = order.partition_point(|&i| keys[i].key < k.key);
+        let run = order[below..].partition_point(|&i| keys[i].key == k.key);
+        hints.push("omit_pos", vec![count(below)]);
+        hints.push("omit_run", vec![count(run)]);
+        let cells = sphincs_signer_cells(claim);
+        for &i in &order[below..below + run] {
+            let other = sphincs_signer_cells(&published[i]);
+            let differs = (0..4)
+                .find(|&c| cells[c] != other[c])
+                .expect("an omitted claim is not published");
+            hints.push("omit_cell", vec![count(differs)]);
+        }
+    }
+}
+
 /// A run of cells the guest hashes with `cell_run_digest`, hinted: its split, then
 /// its cells four to an entry. An empty run hashes without either.
 fn push_cell_run(hints: &mut Hints, cells: Vec<F192>) {
@@ -2574,14 +2624,12 @@ pub(crate) fn aggregate_tampered(
     for &pos in &cover.sphincs_links {
         hints.push("sphincs_link", vec![count(pos)]);
     }
-    // The overlap rule runs only in a node that omits nothing: per linked copy, the
-    // published occurrence's key, then the copy's.
-    if cover.sphincs_omitted.is_empty() {
-        for pair in &cover.sphincs_link_keys {
-            for k in pair {
-                hints.push("credit_key", vec![count(k.key)]);
-                hints.push("credit_key_root", vec![F192::from(k.root)]);
-            }
+    push_absence_hints(&mut hints, &cover.sphincs_signers, &cover.sphincs_omitted);
+    // Then the overlap rule, per linked copy: the published occurrence's key, then
+    // the copy's.
+    for pair in &cover.sphincs_link_keys {
+        for k in pair {
+            push_key(&mut hints, k);
         }
     }
     for signer in &cover.sphincs_omitted {
@@ -6099,10 +6147,12 @@ def main():
             h.entries("child_sphincs_index").swap(in_left, n_left + in_right);
             c[at] = p.iter().position(|q| *q == loser).expect("in the table") as u16;
         };
-        let swap_keys = |h: &mut Hints| {
-            h.entries("credit_key").swap(0, 1);
-            h.entries("credit_key_root").swap(0, 1);
+        // The overlap rule's keys follow the absence pass's, if any.
+        let swap_keys_at = |h: &mut Hints, at: usize| {
+            h.entries("credit_key").swap(at, at + 1);
+            h.entries("credit_key_root").swap(at, at + 1);
         };
+        let swap_keys = |h: &mut Hints| swap_keys_at(h, 0);
         let children = [left, right];
         type SlotHook<'a> = &'a dyn Fn(&mut Hints, &mut Vec<Payee>, &mut Vec<u16>);
         let outcome = |declare: Option<&SignatureClaims>, raw: Vec<RawSphincs>, tamper: SlotHook| {
@@ -6170,23 +6220,177 @@ def main():
             ),
             "a key past the bound must be rejected"
         );
-        // Omitting a raw claim 3 lifts the rule, and the statement says so.
+        // Omitting a raw claim 3 no longer lifts the rule: it is shown absent, so the
+        // copies are still linked and compared. Absence keys first: the three
+        // published claims', then the omitted one's.
         let declared = SignatureClaims {
             xmss: vec![],
             sphincs: published.clone(),
         };
         let raw = vec![claims[3].clone()];
-        assert_eq!(
-            outcome(Some(&declared), raw, &|h, p, c| swap(h, p, c)),
-            Ok((true, 1, loser)),
-            "a node that omits may credit either"
+        let (honest, omitted, credit) = outcome(Some(&declared), raw.clone(), &|_, _, _| {}).expect("proves");
+        assert!(
+            honest && omitted == 1 && credit != loser,
+            "a node that omits keeps the rule"
         );
+        assert!(
+            !matches!(
+                outcome(Some(&declared), raw, &|h, p, c| {
+                    swap(h, p, c);
+                    swap_keys_at(h, published.len() + 1);
+                }),
+                Ok((true, ..))
+            ),
+            "and cannot credit the larger key"
+        );
+        // The published order the absence pass relies on: one claim twice (its key
+        // copied, so the order holds and one claim is missing), or two swapped.
+        let order_lies: &[(&str, SlotHook)] = &[
+            ("sphincs_order (a claim twice)", &|h, _, _| {
+                let first = h.entries("sphincs_order")[0].clone();
+                h.entries("sphincs_order")[1] = first;
+                let (key, root) = (
+                    h.entries("credit_key")[0].clone(),
+                    h.entries("credit_key_root")[0].clone(),
+                );
+                h.entries("credit_key")[1] = key;
+                h.entries("credit_key_root")[1] = root;
+            }),
+            ("sphincs_order (out of key order)", &|h, _, _| {
+                h.entries("sphincs_order").swap(0, 1);
+                swap_keys_at(h, 0);
+            }),
+        ];
+        for (description, tamper) in order_lies {
+            assert!(
+                !matches!(
+                    outcome(Some(&declared), vec![claims[3].clone()], *tamper),
+                    Ok((true, ..))
+                ),
+                "tampering {description} must be rejected"
+            );
+        }
+    }
+
+    /// `absent` alone, over a published order chosen here rather than hashed, so
+    /// a run of published claims can share the omitted claim's key: the honest
+    /// hints pass, and each lie is caught.
+    #[test]
+    fn absence_gadget_covers_the_key_run() {
+        let (helpers, _) = include_str!("../guests/lean_ethereum.py")
+            .split_once("\ndef main():")
+            .unwrap();
+        let source = format!(
+            r#"{helpers}
+def main():
+    n_g = hint_witness("n")
+    sorted_keys = HeapBuf(n_g * GEN * GEN)
+    sorted_ptr = HeapBuf(n_g)
+    claims = HeapBuf(n_g ** 4)
+    sorted_keys[1] = 1
+    for xi in mul_range(1, n_g):
+        c = claims * (xi ** 4)
+        hint_witness(c[0:4], "claim")
+        key = hint_witness("skey")
+        sorted_keys[xi * GEN] = key
+        sorted_ptr[xi] = c
+    sorted_keys[n_g * GEN] = GEN ** 65536
+    omitted = HeapBuf(GEN ** 4)
+    hint_witness(omitted[0:4], "omitted")
+    absent(omitted, sorted_keys, sorted_ptr, n_g)
+    public = GEN ** 0
+    assert public[1] == n_g
+    return
+"#
+        );
+        let guest = compile(&parse_with_replacements(&source, &placeholder_map(18)).unwrap());
+        // An omitted claim whose key leaves room on both sides.
+        let cell = |a: u64, b: u64| F192::new(a, b, 0);
+        let (omitted, k) = (1u64..)
+            .map(|t| {
+                let cells = [cell(t, 1), cell(2, 3), cell(4, 5), cell(6, 7)];
+                (cells, cells_key(cells))
+            })
+            .find(|(_, k)| (1..CREDIT_KEYS - 2).contains(&k.key))
+            .expect("a key");
+        let shifted = k.key + 1;
+        let with = |c: usize, v: F192| {
+            let mut cells = omitted;
+            cells[c] = v;
+            cells
+        };
+        // Published, in key order: below, two sharing the key, above.
+        let published = [
+            with(3, cell(9, 9)),
+            with(2, cell(8, 8)),
+            with(3, cell(7, 7)),
+            with(1, cell(6, 6)),
+        ];
+        let keys = [shifted - 1, shifted, shifted, shifted + 1];
+        let accepts = |published: &[[F192; 4]], pos: usize, run: usize, cells: &[usize]| {
+            let mut hints = Hints::default();
+            hints.push("n", vec![count(published.len())]);
+            for (c, &key) in published.iter().zip(&keys) {
+                hints.push("claim", c.to_vec());
+                hints.push("skey", vec![count(key)]);
+            }
+            hints.push("omitted", omitted.to_vec());
+            push_key(&mut hints, &k);
+            hints.push("omit_pos", vec![count(pos)]);
+            hints.push("omit_run", vec![count(run)]);
+            for &c in cells {
+                hints.push("omit_cell", vec![count(c)]);
+            }
+            let mut program = guest.clone();
+            hints.install(&mut program);
+            program.execute([count(published.len()), F192::ZERO]).is_ok()
+        };
+        assert!(accepts(&published, 1, 2, &[2, 3]), "the honest run");
+        let mut twin = published;
+        twin[2] = omitted;
+        for c in 0..4 {
+            assert!(!accepts(&twin, 1, 2, &[2, c]), "a published twin, cell {c}");
+        }
+        assert!(!accepts(&published, 1, 2, &[2, 0]), "a cell where the two agree");
+        assert!(!accepts(&published, 1, 1, &[2]), "a run cut short");
+        assert!(!accepts(&published, 2, 1, &[3]), "a run started late");
+        assert!(!accepts(&published, 0, 3, &[3, 2, 3]), "a run holding a smaller key");
+        assert!(!accepts(&published, 5, 0, &[]), "a position past the list");
+    }
+
+    /// The absence hints a prover would give for `claim` if it were omitted though
+    /// published (`push_absence_hints` refuses): the run of its key, or, with
+    /// `skip`, the run minus its published twin. Its keys go ahead of the overlap
+    /// rule's, as the guest reads them.
+    fn cheat_absence(h: &mut Hints, published: &[SphincsClaim], claim: &SphincsClaim, skip: bool) {
+        let keys: Vec<CreditKey> = published.iter().map(claim_key).collect();
+        let mut order: Vec<usize> = (0..published.len()).collect();
+        order.sort_by_key(|&i| (keys[i].key, i));
+        let mut pass: Vec<CreditKey> = order.iter().map(|&i| keys[i]).collect();
+        for &i in &order {
+            h.push("sphincs_order", vec![count(i)]);
+        }
+        let k = claim_key(claim);
+        pass.push(k);
+        h.entries("credit_key")
+            .splice(0..0, pass.iter().map(|k| vec![count(k.key)]));
+        h.entries("credit_key_root")
+            .splice(0..0, pass.iter().map(|k| vec![F192::from(k.root)]));
+        let below = order.partition_point(|&i| keys[i].key < k.key);
+        let run = order[below..].partition_point(|&i| keys[i].key == k.key);
+        let (pos, len) = if skip { (below + 1, run - 1) } else { (below, run) };
+        h.push("omit_pos", vec![count(pos)]);
+        h.push("omit_run", vec![count(len)]);
+        for _ in 0..len {
+            h.push("omit_cell", vec![count(0)]);
+        }
     }
 
     /// A second occurrence of a published SPHINCS claim sits in a linked slot, a
     /// copy of the published slot it names; the claims a node covers and does not
     /// publish sit in the omitted slots after them, and the statement carries how
-    /// many. A copy may still be put among the omitted, but only by saying so.
+    /// many. Each omitted claim is shown absent from the published list, so a copy
+    /// cannot be put among them.
     #[test]
     fn sphincs_copies_link_to_their_claim() {
         lean_vm::init_prover_pool();
@@ -6201,6 +6405,15 @@ def main():
         let children = [leaf(0..2), leaf(1..3)];
         let raw = vec![claims[1].clone()];
         let copied = (claims[1].0, claims[1].1);
+        let mut published: Vec<SphincsClaim> = claims.iter().map(|(pk, m, _)| (*pk, *m)).collect();
+        published.sort();
+        let move_copy = |h: &mut Hints, omitted: &mut u16| {
+            h.entries("sphincs_link").pop();
+            h.entries("meta")[0][3] = count(1);
+            h.entries("meta")[0][4] = count(1);
+            h.push("dup_sphincs", sphincs_signer_cells(&copied).to_vec());
+            *omitted = 1;
+        };
         type LinkHook<'a> = &'a dyn Fn(&mut Hints, &mut u16);
         let outcome = |tamper: LinkHook| {
             aggregate_tampered(
@@ -6231,12 +6444,16 @@ def main():
                 *omitted = 1
             }),
             // The last linked slot is the first omitted one, so a copy moves there
-            // without changing any coverage index: allowed, but not silently.
-            ("meta (a copy moved among the omitted, not published)", &|h, _| {
-                h.entries("sphincs_link").pop();
-                h.entries("meta")[0][3] = count(1);
-                h.entries("meta")[0][4] = count(1);
-                h.push("dup_sphincs", sphincs_signer_cells(&copied).to_vec());
+            // without changing any coverage index, counted, with the best absence
+            // hints a prover has for it: the run holding its published twin, whose
+            // cells all agree, or a run that skips it, whose neighbour then ties.
+            ("a copy among the omitted, its twin in the run", &|h, omitted| {
+                move_copy(h, omitted);
+                cheat_absence(h, &published, &copied, false);
+            }),
+            ("a copy among the omitted, its twin skipped", &|h, omitted| {
+                move_copy(h, omitted);
+                cheat_absence(h, &published, &copied, true);
             }),
         ];
         for (description, tamper) in rejected {
@@ -6245,18 +6462,6 @@ def main():
                 "tampering {description} must be rejected"
             );
         }
-        let moved = |h: &mut Hints, omitted: &mut u16| {
-            h.entries("sphincs_link").pop();
-            h.entries("meta")[0][3] = count(1);
-            h.entries("meta")[0][4] = count(1);
-            h.push("dup_sphincs", sphincs_signer_cells(&copied).to_vec());
-            *omitted = 1;
-        };
-        assert_eq!(
-            outcome(&moved),
-            Ok((true, 1)),
-            "a copy among the omitted, published as one"
-        );
     }
 
     #[test]

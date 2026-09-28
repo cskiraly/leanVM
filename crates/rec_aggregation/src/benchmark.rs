@@ -7,7 +7,7 @@ use primitives::{pretty_f64, pretty_integer};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use xmss::{XmssPublicKey, XmssSignature};
 
-use crate::aggregation::{DaInput, EthereumProof, Payee, aggregate, aggregate_with_stats};
+use crate::aggregation::{DaInput, EthereumProof, Payee, SignatureClaims, aggregate, aggregate_with_stats};
 use crate::signers_cache;
 
 /// Who proves the benchmarked node; each recursion leaf has its own, so the node's
@@ -168,13 +168,16 @@ pub fn run_aggregation(n_xmss: usize, n_sphincs: usize, n_blobs: usize, log_inv_
 /// recursion step and verify the result. The leaves are built once; only the
 /// recursion step is measured. With `sphincs_overlap` every leaf holds the same
 /// SPHINCS signatures under its own payee, so each claim reaches the node `n`
-/// times and the overlap rule compares every copy.
+/// times and the overlap rule compares every copy. With `sphincs_omit` the node
+/// publishes all but that many of the SPHINCS claims, so it proves each omitted one
+/// absent from the rest.
 #[allow(clippy::too_many_arguments)]
 pub fn run_recursion(
     n: usize,
     per_leaf: usize,
     sphincs_per_leaf: usize,
     sphincs_overlap: bool,
+    sphincs_omit: usize,
     blobs_per_leaf: usize,
     log_inv_rate: usize,
     enable_tracing: bool,
@@ -223,6 +226,24 @@ pub fn run_recursion(
         })
         .collect();
 
+    let declared = (sphincs_omit > 0).then(|| {
+        assert!(
+            per_leaf == 0 && blobs_per_leaf == 0,
+            "--sphincs-omit declares SPHINCS claims only"
+        );
+        let mut sphincs: Vec<_> = children
+            .iter()
+            .flat_map(|c| c.sphincs_signers().iter().copied())
+            .collect();
+        sphincs.sort();
+        sphincs.dedup();
+        assert!(sphincs_omit < sphincs.len(), "omitting every claim publishes nothing");
+        SignatureClaims {
+            xmss: vec![],
+            sphincs: sphincs.split_off(sphincs_omit),
+        }
+    });
+
     if enable_tracing {
         primitives::init_tracing();
     }
@@ -232,7 +253,7 @@ pub fn run_recursion(
             &children,
             vec![],
             vec![],
-            None,
+            declared.as_ref(),
             DaInput::default(),
             PAYEE_NODE,
             log_inv_rate,
@@ -256,6 +277,9 @@ pub fn run_recursion(
     }
     if sphincs_overlap && sphincs_per_leaf > 0 {
         inputs.push("the same SPHINCS in every leaf".to_string());
+    }
+    if sphincs_omit > 0 {
+        inputs.push(format!("{sphincs_omit} SPHINCS omitted"));
     }
     if blobs_per_leaf > 0 {
         inputs.push(format!("{blobs_per_leaf} blobs"));

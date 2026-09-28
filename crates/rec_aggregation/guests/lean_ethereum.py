@@ -2954,10 +2954,79 @@ def credit_key(prefix_0, prefix_1, payee):
     # unprovable, and a payee can grind its address to reach one.
     digest = StackBuf(2)
     blake2s(payee[0:2], [0, 0], digest, cv=[prefix_0, prefix_1], counter=96, final=1)
+    return digest_key(digest[0])
+
+
+@inline
+def digest_key(cell):
+    # `lane_key` of a digest's first lane: the cell's low limb, proven by
+    # rebuilding the cell from both limbs in K.
     lane = StackBuf(1)
-    hint_f192_limbs(lane, digest[0])
-    assert_in_k(lane[0], (digest[0] + lane[0]) * Y_INV)
+    hint_f192_limbs(lane, cell)
+    assert_in_k(lane[0], (cell + lane[0]) * Y_INV)
     return lane_key(lane[0])
+
+
+@inline
+def claim_key(claim):
+    # g^k(c) for a SPHINCS claim: the norm key of the first lane of BLAKE2s(c),
+    # the claim's four cells one final 64-byte block.
+    digest = StackBuf(2)
+    blake2s(claim[0:2], claim[2:4], digest, counter=64, final=1)
+    return digest_key(digest[0])
+
+
+def sort_published(sphincs_table, n_g, sorted_keys, sorted_ptr):
+    # The published SPHINCS claims in key order, for `absent`. The prover hints,
+    # per position, which published claim sits there; each writes a distinct mark
+    # into `order` at its source, so no source is used twice and the n positions
+    # are a permutation of the n claims. Keys are stored shifted, g^(k+1), with
+    # sentinels g^0 below and g^65536 above: `sorted_keys[g^(i+1)]` is position i's,
+    # and every key must be at least the one before it. `sorted_ptr[g^i]` points at
+    # position i's claim.
+    order = HeapBuf(n_g)
+    sorted_keys[1] = 1
+    for xi in mul_range(1, n_g):
+        src = hint_witness("sphincs_order")
+        assert log(src) < log(n_g)
+        order[src] = xi
+        claim = sphincs_table * (src ** 4)
+        shifted = claim_key(claim) * GEN
+        prev = sorted_keys[xi]
+        assert log(prev) < log(shifted * GEN)
+        sorted_keys[xi * GEN] = shifted
+        sorted_ptr[xi] = claim
+    sorted_keys[n_g * GEN] = GEN ** 65536
+    return
+
+
+def absent(claim, sorted_keys, sorted_ptr, n_g):
+    # Non-membership of `claim` in the published list, over `sort_published`'s
+    # order. The prover hints p, how many published keys are smaller than the
+    # claim's, and r, how many are equal. The key before position p is smaller,
+    # the one at p + r larger, both strictly; the r between share the claim's key
+    # and each differs from the claim in a hinted cell. Keys never decrease along
+    # the order, so every published claim with this key is one of those r, and
+    # none is the claim. Bounding p and r keeps every read at or past the key
+    # buffer's start; a run past the end would hold the upper sentinel, which no
+    # key equals.
+    shifted = claim_key(claim) * GEN
+    pos = hint_witness("omit_pos")
+    run = hint_witness("omit_run")
+    assert log(pos) < log(n_g * GEN)
+    assert log(run) < log(n_g * GEN)
+    below = sorted_keys[pos]
+    above = sorted_keys[pos * run * GEN]
+    assert log(below) < log(shifted)
+    assert log(shifted) < log(above)
+    for xm in mul_range(1, run):
+        at = pos * xm
+        assert sorted_keys[at * GEN] == shifted
+        other = sorted_ptr[at]
+        cell = hint_witness("omit_cell")
+        assert log(cell) < 4
+        assert claim[cell] != other[cell]
+    return
 
 
 @inline
@@ -3598,9 +3667,8 @@ def main():
     # The SPHINCS duplicate slots are [linked copies | omitted]. A linked copy is a
     # second occurrence of a declared claim, its four cells copied from the declared
     # slot a hinted index names. The omitted slots hold claims this node covers and
-    # does not publish; the statement carries their count, and a copy of a declared
-    # claim may hide there too, so only a statement that omits nothing says every
-    # other occurrence of a declared claim is linked to it.
+    # does not publish, each shown absent from the declared list (`absent`), so no
+    # copy of a declared claim hides there; the statement carries their count.
     links = HeapBuf(n_slink_g)
     for xd in mul_range(1, n_slink_g):
         idx = hint_witness("sphincs_link")
@@ -3758,20 +3826,30 @@ def main():
     else:
         aggregate_claims(n_children_g, child_pi, child_fresh, child_carried, defer_stmt)
 
+    # ---- omitted claims are not published ----
+    # Each omitted SPHINCS claim is shown absent from the published list, so a
+    # copy of a published claim cannot sit among the omitted: every other
+    # occurrence of a published claim is a linked copy, in every node. The
+    # published keys are only needed for this, so a node that omits nothing
+    # skips it. The key hints of this pass come before the overlap rule's.
+    sorted_keys = HeapBuf(n_sphincs_g * GEN * GEN)
+    sorted_ptr = HeapBuf(n_sphincs_g)
+    if n_somit_g != 1:
+        sort_published(sphincs_table, n_sphincs_g, sorted_keys, sorted_ptr)
+        for xj in mul_range(1, n_somit_g):
+            absent(sphincs_table * ((n_sphincs_g * n_slink_g * xj) ** 4), sorted_keys, sorted_ptr, n_sphincs_g)
+
     # ---- the overlap rule ----
     # A claim covered more than once is credited to the occurrence with the least
     # key (`credit_key`): each linked copy's key is at least its published slot's.
-    # Only in a node that omits nothing, where every other occurrence of a
-    # published claim is a linked copy; the statement's omitted count says which.
-    if n_somit_g == 1:
-        for xd in mul_range(1, n_slink_g):
-            idx = links[xd]
-            claim = sphincs_table * (idx ** 4)
-            prefix = StackBuf(2)
-            blake2s(claim[0:2], claim[2:4], prefix, counter=64)
-            key_pub = credit_key(prefix[0], prefix[1], payee_of[idx])
-            key_copy = credit_key(prefix[0], prefix[1], payee_of[n_sphincs_g * xd])
-            assert log(key_pub) < log(key_copy * GEN)
+    for xd in mul_range(1, n_slink_g):
+        idx = links[xd]
+        claim = sphincs_table * (idx ** 4)
+        prefix = StackBuf(2)
+        blake2s(claim[0:2], claim[2:4], prefix, counter=64)
+        key_pub = credit_key(prefix[0], prefix[1], payee_of[idx])
+        key_copy = credit_key(prefix[0], prefix[1], payee_of[n_sphincs_g * xd])
+        assert log(key_pub) < log(key_copy * GEN)
 
     cr_0, cr_1 = credit_digest(credits, n_sphincs_g, payee_0, payee_1, g_squares, 0)
     own_0, own_1 = statement_digest(seed_0, seed_1, signers_hash, da_0, da_1, cr_0, cr_1, n_somit_g, defer_stmt)
