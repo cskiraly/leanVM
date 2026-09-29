@@ -87,7 +87,7 @@ fn public_api_end_to_end() {
         } else {
             RIGHT
         };
-        assert_eq!(received.sphincs_payee(i), &verifier);
+        assert!(received.sphincs_payees(i).eq([&verifier]));
     }
 
     // 5. Removing some signatures from the aggregate: `declare` is what we keep. Here the first group goes whole.
