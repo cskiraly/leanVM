@@ -2312,14 +2312,14 @@ fn plan_credits(
     Ok((payees, sets))
 }
 
-/// The guest's `credit_sets`, `fold_contributions` and `own_credit_lists` hints.
-/// Contributions are numbered in the guest's order: per occurrence slot, per
-/// element (with its position in its claim's set, none for one element against a
-/// set of one), then, in a fold that merges, a zero weight to this node's entry of
-/// each claim. Each contribution that does not attain its entry's maximum gets the
-/// difference in two 16-bit limbs; each entry gets its base (the maximum) and the
-/// id of the first contribution that attains it. Then the fold share's limbs and
-/// remainder, and the contribution count.
+/// The guest's `credit_sets` and `own_credit_lists` hints. Contributions are
+/// numbered in the guest's order: per occurrence slot, per element (with its
+/// position in its claim's set, none for one element against a set of one or
+/// two). Each contribution that does not attain its entry's maximum gets the
+/// difference in two 16-bit limbs; each entry gets the id of the first
+/// contribution that attains its maximum (the contribution count for this node's
+/// entry when nothing contributes to it), and this node's entries their base.
+/// Then the fold share's limbs and remainder, and the contribution count.
 fn push_credit_set_hints(
     hints: &mut Hints,
     occurrences: &[Vec<(Payee, u64)>],
@@ -2347,43 +2347,17 @@ fn push_credit_set_hints(
                 .iter()
                 .position(|c| c.payee == index[&p])
                 .expect("in its claim's set");
-            if elements.len() * set.len() != 1 {
+            if !(elements.len() == 1 && set.len() <= 2) {
                 hints.push("credit_pos", vec![count(q)]);
             }
             contributions.push((starts[j] + q, w));
-        }
-    }
-    if fold.is_some() {
-        for j in 0..n_sphincs {
-            contributions.push((starts[j], 0));
         }
     }
     let mut base = vec![0u64; at];
     for &(e, w) in &contributions {
         base[e] = base[e].max(w);
     }
-    let arg: Vec<usize> = (0..at)
-        .map(|e| {
-            contributions
-                .iter()
-                .position(|&(f, w)| f == e && w == base[e])
-                .expect("an entry's maximum is a contribution")
-        })
-        .collect();
-    for (id, &(e, w)) in contributions.iter().enumerate() {
-        if arg[e] != id {
-            let d = base[e] - w;
-            assert!(d < 1 << 32, "a weight difference past 2^32");
-            hints.push(
-                "credit_gap",
-                vec![count((d & 0xffff) as usize), count((d >> 16) as usize)],
-            );
-        }
-    }
-    for e in 0..at {
-        hints.push("credit_base", vec![count(base[e] as usize)]);
-        hints.push("credit_arg", vec![count(arg[e])]);
-    }
+    push_join_hints(hints, sets, &starts, &contributions, &base, &[]);
     if let Some(f) = fold {
         let u = (n_children as u64 - 1) * MERGE_WEIGHT;
         hints.push(
@@ -2393,6 +2367,44 @@ fn push_credit_set_hints(
         hints.push("fold_rem", vec![count((u - f * n_sphincs as u64) as usize)]);
     }
     hints.push("credit_total", vec![count(contributions.len())]);
+}
+
+/// The guest's `credit_join` and `own_credit_lists` hints for the maximum:
+/// per contribution (entry, weight), whether it is the first to attain its
+/// entry's `base`, and if not the difference in two 16-bit limbs (`gap`
+/// overrides a contribution's limbs, for tests); then per claim whose set leads
+/// with this node, that entry's base and whether it is empty.
+fn push_join_hints(
+    hints: &mut Hints,
+    sets: &[Vec<Credit>],
+    starts: &[usize],
+    contributions: &[(usize, u64)],
+    base: &[u64],
+    gap: &[(usize, [F192; 2])],
+) {
+    let top: Vec<Option<usize>> = (0..base.len())
+        .map(|e| contributions.iter().position(|&(f, w)| f == e && w == base[e]))
+        .collect();
+    for (id, &(e, w)) in contributions.iter().enumerate() {
+        if top[e] == Some(id) {
+            hints.push("credit_top", vec![count(1)]);
+        } else {
+            hints.push("credit_top", vec![count(0)]);
+            let d = base[e].wrapping_sub(w) & 0xffff_ffff;
+            let limbs = gap.iter().find(|(g, _)| *g == id).map_or(
+                vec![count((d & 0xffff) as usize), count((d >> 16) as usize)],
+                |(_, l)| l.to_vec(),
+            );
+            hints.push("credit_gap", limbs);
+        }
+    }
+    for (j, set) in sets.iter().enumerate() {
+        if set.first().is_some_and(|c| c.payee == 0) {
+            let e = starts[j];
+            hints.push("credit_base", vec![count(base[e] as usize)]);
+            hints.push("credit_empty", vec![count(usize::from(top[e].is_none()))]);
+        }
+    }
 }
 
 /// The guest's `children_distinct` hints: for every ordered pair of distinct
@@ -6552,19 +6564,15 @@ def main():
     flat = HeapBuf(n_pairs_g)
     wts = HeapBuf(n_pairs_g)
     base = HeapBuf(n_pairs_g)
-    arg = HeapBuf(n_pairs_g)
-    owner = HeapBuf(n_contrib_g)
-    c0, c1, f0, f1, w0, w1 = own_credit_lists(counts, flat, wts, starts, base, arg, n_sphincs_g, n_pairs_g, n_contrib_g, fold_g, g_squares)
+    att = HeapBuf(n_pairs_g)
+    empties = HeapBuf(n_sphincs_g * GEN)
+    c0, c1, f0, f1, w0, w1, n_empty_g = own_credit_lists(counts, flat, wts, starts, base, att, empties, n_sphincs_g, n_pairs_g, n_contrib_g, fold_g, g_squares)
     ids = HeapBuf(n_occ_g * GEN)
-    occ_count = credit_sets(counts, flat, starts, base, arg, owner, slot_sets, claim_of, n_occ_g, ids)
-    own = HeapBuf(GEN)
-    if fold_g == 1:
-        own[1] = 1
-    else:
-        fold_contributions(n_sphincs_g, occ_count, flat, starts, base, arg, owner)
-        own[1] = n_sphincs_g
-    assert occ_count * own[1] == n_contrib_g
-    credit_attained(arg, owner, n_pairs_g)
+    tops = HeapBuf(n_contrib_g * GEN)
+    tops[1] = 1
+    occ_count = credit_sets(counts, flat, starts, base, att, tops, slot_sets, claim_of, n_occ_g, ids)
+    assert occ_count == n_contrib_g
+    assert tops[n_contrib_g] * n_empty_g == n_pairs_g
     public = GEN ** 0
     assert public[1] == n_occ_g
     return
@@ -6579,8 +6587,10 @@ def main():
         // host would, except where `base` and `arg` override an entry's.
         struct Lie<'a> {
             base: &'a [(usize, u64)],
-            arg: &'a [(usize, usize)],
+            top: &'a [usize],
+            empty: &'a [usize],
             gap: &'a [(usize, [F192; 2])],
+            pos: &'a [(usize, usize)],
         }
         let run = |sets: &Sets, occurrences: &Occurrences, fold: Option<u64>, lie: Lie| {
             let mut hints = Hints::default();
@@ -6615,16 +6625,16 @@ def main():
             for (j, elements) in occurrences {
                 let set = &sets[*j];
                 for &(p, w) in elements {
-                    let q = set.iter().position(|&(x, _)| x == p).unwrap_or(0);
-                    if elements.len() * set.len() != 1 {
+                    let id = contributions.len();
+                    let q = lie
+                        .pos
+                        .iter()
+                        .find(|(c, _)| *c == id)
+                        .map_or_else(|| set.iter().position(|&(x, _)| x == p).unwrap_or(0), |(_, q)| *q);
+                    if !(elements.len() == 1 && set.len() <= 2) {
                         hints.push("credit_pos", vec![count(q)]);
                     }
                     contributions.push((starts[*j] + q, w));
-                }
-            }
-            if fold.is_some() {
-                for &st in &starts {
-                    contributions.push((st, 0));
                 }
             }
             let mut base = vec![0u64; at];
@@ -6634,19 +6644,16 @@ def main():
             for &(e, b) in lie.base {
                 base[e] = b;
             }
-            let mut arg: Vec<usize> = (0..at)
-                .map(|e| {
-                    contributions
-                        .iter()
-                        .position(|&(f, w)| f == e && w == base[e])
-                        .unwrap_or(0)
-                })
+            // The host's flags, where `top` adds tops and `empty` marks claims'
+            // own entries empty.
+            let first_top: Vec<Option<usize>> = (0..at)
+                .map(|e| contributions.iter().position(|&(f, w)| f == e && w == base[e]))
                 .collect();
-            for &(e, a) in lie.arg {
-                arg[e] = a;
-            }
             for (id, &(e, w)) in contributions.iter().enumerate() {
-                if arg[e] != id {
+                if first_top[e] == Some(id) || lie.top.contains(&id) {
+                    hints.push("credit_top", vec![count(1)]);
+                } else {
+                    hints.push("credit_top", vec![count(0)]);
                     let d = base[e].wrapping_sub(w) & 0xffff_ffff;
                     let limbs = lie.gap.iter().find(|(g, _)| *g == id).map_or(
                         vec![count((d & 0xffff) as usize), count((d >> 16) as usize)],
@@ -6655,9 +6662,13 @@ def main():
                     hints.push("credit_gap", limbs);
                 }
             }
-            for e in 0..at {
-                hints.push("credit_base", vec![count(base[e] as usize)]);
-                hints.push("credit_arg", vec![count(arg[e])]);
+            for (j, set) in sets.iter().enumerate() {
+                if set.first().is_some_and(|&(p, _)| p == 0) {
+                    let e = starts[j];
+                    let empty = first_top[e].is_none() || lie.empty.contains(&j);
+                    hints.push("credit_base", vec![count(base[e] as usize)]);
+                    hints.push("credit_empty", vec![count(usize::from(empty))]);
+                }
             }
             hints.push("credit_total", vec![count(contributions.len())]);
             let mut program = guest.clone();
@@ -6672,8 +6683,10 @@ def main():
         };
         let honest = || Lie {
             base: &[],
-            arg: &[],
+            top: &[],
+            empty: &[],
             gap: &[],
+            pos: &[],
         };
         // Claim 0 at slots 0 and 2 (a linked copy), claim 1 at slot 1: payee 0
         // reaches claim 0 twice, with weights 5 and 4.
@@ -6706,8 +6719,10 @@ def main():
         );
         let above = Lie {
             base: &[(0, 6)],
-            arg: &[],
+            top: &[],
+            empty: &[],
             gap: &[],
+            pos: &[],
         };
         assert_eq!(
             run(&vec![vec![(0, 6), (2, 3)], vec![(1, 7)]], &occurrences(), None, above),
@@ -6717,8 +6732,10 @@ def main():
         // Below a contribution: 5 does not fit under 4 in two 16-bit limbs.
         let below = Lie {
             base: &[(0, 4)],
-            arg: &[(0, 3)],
+            top: &[],
+            empty: &[],
             gap: &[],
+            pos: &[],
         };
         assert_eq!(
             run(&vec![vec![(0, 4), (2, 3)], vec![(1, 7)]], &occurrences(), None, below),
@@ -6730,8 +6747,10 @@ def main():
         // difference non-negative.
         let low = Lie {
             base: &[(0, 4)],
-            arg: &[(0, 3)],
+            top: &[],
+            empty: &[],
             gap: &[(0, [F192::from(G.inv()), F192::ONE])],
+            pos: &[],
         };
         assert_eq!(
             run(&vec![vec![(0, 4), (2, 3)], vec![(1, 7)]], &occurrences(), None, low),
@@ -6740,8 +6759,10 @@ def main():
         );
         let high = Lie {
             base: &[(0, 4)],
-            arg: &[(0, 3)],
+            top: &[],
+            empty: &[],
             gap: &[(0, [F192::ONE, F192::from(f64_pow(G, u64::MAX - (1 << 48)))])],
+            pos: &[],
         };
         assert_eq!(
             run(&vec![vec![(0, 4), (2, 3)], vec![(1, 7)]], &occurrences(), None, high),
@@ -6764,30 +6785,64 @@ def main():
         // A lone verifier renamed: claim 1's only occurrence names payee 1.
         let none = Lie {
             base: &[],
-            arg: &[],
+            top: &[],
+            empty: &[],
             gap: &[],
+            pos: &[],
         };
         assert_eq!(
             run(&vec![vec![(0, 5), (2, 3)], vec![(0, 7)]], &occurrences(), None, none),
             None,
             "a lone verifier renamed"
         );
-        // A designation that is another entry's contribution: payee 2's entry names
-        // contribution 0, which joined payee 0's.
-        let elsewhere = Lie {
+        // Two tops on one entry, the count they free spent on an entry nobody
+        // attains: payee 0 reaches claim 0 twice with 5, and payee 2's entry claims
+        // 100 from its 3. Only the marks tell the two tops apart.
+        let twice = || -> Occurrences { vec![(0, vec![(0, 5)]), (1, vec![(1, 7)]), (0, vec![(2, 3), (0, 5)])] };
+        let doubled = Lie {
             base: &[(1, 100)],
-            arg: &[(1, 0)],
+            top: &[3],
+            empty: &[],
             gap: &[],
+            pos: &[],
         };
         assert_eq!(
-            run(
-                &vec![vec![(0, 5), (2, 100)], vec![(1, 7)]],
-                &occurrences(),
-                None,
-                elsewhere
-            ),
+            run(&vec![vec![(0, 5), (2, 100)], vec![(1, 7)]], &twice(), None, doubled),
             None,
-            "a designation of another entry's contribution"
+            "two tops on one entry"
+        );
+        // An empty own entry that also has a top: a child's zero-weight credit to
+        // this node, counted twice, the count it frees spent on a fabricated entry.
+        let zero = || -> Occurrences { vec![(0, vec![(0, 0)]), (1, vec![(1, 7)])] };
+        assert_eq!(
+            run(&vec![vec![(0, 0)], vec![(1, 7)]], &zero(), None, honest()),
+            Some(true),
+            "a zero weight"
+        );
+        let hollow = Lie {
+            base: &[],
+            top: &[],
+            empty: &[0],
+            gap: &[],
+            pos: &[],
+        };
+        assert_eq!(
+            run(&vec![vec![(0, 0), (3, 1)], vec![(1, 7)]], &zero(), None, hollow),
+            None,
+            "an empty entry with a top"
+        );
+        // An empty own entry with a base above 0.
+        let lifted = Lie {
+            base: &[(0, 9)],
+            top: &[],
+            empty: &[0],
+            gap: &[],
+            pos: &[],
+        };
+        assert_eq!(
+            run(&vec![vec![(0, 9), (2, 3)], vec![(1, 7)]], &occurrences(), None, lifted),
+            None,
+            "an empty entry with a base above 0"
         );
         // An entry nobody contributed to.
         let fabricated: Sets = vec![vec![(0, 5), (2, 3), (3, 1)], vec![(1, 7)]];
@@ -6814,11 +6869,93 @@ def main():
             None,
             "a fold share missing from this node's weight"
         );
+        // Payees out of order, in a set of two and of three.
+        let three = || -> Occurrences { vec![(0, vec![(0, 5)]), (0, vec![(2, 3), (3, 1)]), (1, vec![(1, 7)])] };
+        assert_eq!(
+            run(
+                &vec![vec![(0, 5), (2, 3), (3, 1)], vec![(1, 7)]],
+                &three(),
+                None,
+                honest()
+            ),
+            Some(true),
+            "a set of three"
+        );
+        assert_eq!(
+            run(
+                &vec![vec![(0, 5), (3, 1), (2, 3)], vec![(1, 7)]],
+                &three(),
+                None,
+                honest()
+            ),
+            None,
+            "a set of three out of order"
+        );
+        assert_eq!(
+            run(
+                &vec![vec![(2, 3), (0, 5)], vec![(1, 7)]],
+                &occurrences(),
+                None,
+                honest()
+            ),
+            None,
+            "a set of two out of order"
+        );
+        // A verifier's work moved to another payee's entry and the verifier
+        // dropped, against a set of two (no position hint: the guest tries both
+        // entries) and of three (a hinted position).
+        let two = || -> Occurrences {
+            vec![
+                (0, vec![(0, 5)]),
+                (0, vec![(2, 3)]),
+                (0, vec![(3, 1)]),
+                (1, vec![(1, 7)]),
+            ]
+        };
+        let into_second = Lie {
+            base: &[],
+            top: &[],
+            empty: &[],
+            gap: &[],
+            pos: &[(0, 1)],
+        };
+        assert_eq!(
+            run(&vec![vec![(2, 3), (3, 5)], vec![(1, 7)]], &two(), None, into_second),
+            None,
+            "a verifier's work moved within a set of two"
+        );
+        let four = || -> Occurrences {
+            vec![
+                (0, vec![(1, 2)]),
+                (0, vec![(0, 5)]),
+                (0, vec![(2, 3)]),
+                (0, vec![(3, 1)]),
+                (1, vec![(1, 7)]),
+            ]
+        };
+        let into_first = Lie {
+            base: &[],
+            top: &[],
+            empty: &[],
+            gap: &[],
+            pos: &[(1, 0)],
+        };
+        assert_eq!(
+            run(
+                &vec![vec![(1, 5), (2, 3), (3, 1)], vec![(1, 7)]],
+                &four(),
+                None,
+                into_first
+            ),
+            None,
+            "a verifier's work moved within a set of three"
+        );
+        // A fold may leave its own entry out of a claim: it only forgoes its share.
         let unled: Sets = vec![vec![(0, 5 + 11), (2, 3)], vec![(1, 7)]];
         assert_eq!(
             run(&unled, &occurrences(), Some(11), honest()),
-            None,
-            "a fold share on a set without this node"
+            Some(true),
+            "a fold without its own entry in a claim"
         );
     }
 

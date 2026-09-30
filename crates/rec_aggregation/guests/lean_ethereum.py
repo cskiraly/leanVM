@@ -3075,66 +3075,83 @@ def credit_digest(counts_0, counts_1, flat_0, flat_1, wts_0, wts_1, payee_0, pay
     return digest[0], digest[1]
 
 
-def own_credit_lists(counts, flat, wts, starts, base, arg, n_claims_g, n_pairs_g, n_contrib_g, fold_g, g_squares):
+def own_credit_lists(counts, flat, wts, starts, base, att, empties, n_claims_g, n_pairs_g, n_contrib_g, fold_g, g_squares):
     # This node's credit sets, hinted and hashed like a child's (`credit_lists`),
     # each set's payees strictly increasing, so one set has one encoding. Their
     # payees are not range-checked: each equals the mapped payee of a contribution
     # (`credit_join`), a checked index or the 0 of a dropped payee, and a 0 fails
-    # the range check of whoever reads the list. Each entry also gets a hinted
-    # base, the maximum weight of its contributions, and the id of a contribution
-    # that attains it (below the contribution count). Its published weight is the
-    # base, and for this node's own entry (payee 0) the base times this fold's
-    # share (g^0 when it does not merge).
+    # the range check of whoever reads the list. Each entry's base is the maximum
+    # of its contributions: its published weight, except this node's own entry
+    # (payee 0, the least, so first in its set), whose weight adds the fold's share
+    # to a hinted base. That entry may be empty, base 0 and no contribution: the
+    # entry of a fold that merges where no occurrence names this node. Leaving its
+    # own entry out only costs this node its share, so nothing forces it. An empty
+    # entry marks `att` with the contribution count, an id no contribution has.
+    # `empties` counts them; returns their count with the three digests.
     counts_0, counts_1 = cell_run_digest(counts, n_claims_g, g_squares, 1)
     flat_0, flat_1 = cell_run_digest(flat, n_pairs_g, g_squares, 1)
     wts_0, wts_1 = cell_run_digest(wts, n_pairs_g, g_squares, 1)
     starts[1] = 1
+    empties[1] = 1
     for xj in mul_range(1, n_claims_g):
         m = counts[xj]
         assert m != 1
         assert log(m) < MAX_PAYEES + 1
         at = starts[xj]
         starts[xj * GEN] = at * m
-        if m != GEN:
-            set_j = flat * at
-            if m == GEN * GEN:
-                assert log(set_j[1]) < log(set_j[GEN])
+        if flat[at] == 1:
+            b = hint_witness("credit_base")
+            assert wts[at] == b * fold_g
+            base[at] = b
+            empty = hint_witness("credit_empty")
+            if empty == GEN:
+                assert b == 1
+                att[at] = n_contrib_g
+                empties[xj * GEN] = empties[xj] * GEN
             else:
-                credit_set_order(set_j, m)
-    assert starts[n_claims_g] == n_pairs_g
-    for xe in mul_range(1, n_pairs_g):
-        b = hint_witness("credit_base")
-        base[xe] = b
-        a = hint_witness("credit_arg")
-        assert log(a) < log(n_contrib_g)
-        arg[xe] = a
-        if flat[xe] == 1:
-            assert wts[xe] == b * fold_g
+                # Any other flag counts as not empty, the safe side.
+                empties[xj * GEN] = empties[xj]
         else:
-            assert wts[xe] == b
-    return counts_0, counts_1, flat_0, flat_1, wts_0, wts_1
+            base[at] = wts[at]
+            empties[xj * GEN] = empties[xj]
+        if m != GEN:
+            if m == GEN * GEN:
+                base[at * GEN] = wts[at * GEN]
+                assert log(flat[at]) < log(flat[at * GEN])
+            else:
+                credit_rest(at, m, flat, wts, base)
+    assert starts[n_claims_g] == n_pairs_g
+    return counts_0, counts_1, flat_0, flat_1, wts_0, wts_1, empties[n_claims_g]
 
 
-def credit_set_order(set_j, m_j):
-    # A set of three or more, strictly increasing.
-    for xu in mul_range(1, m_j * INV_GEN):
-        assert log(set_j[xu]) < log(set_j[xu * GEN])
+def credit_rest(at, m, flat, wts, base):
+    # The entries after the first of a set of three or more: their base is their
+    # weight, and the payees strictly increase.
+    for xu in mul_range(GEN, m):
+        base[at * xu] = wts[at * xu]
+    for xu in mul_range(1, m * INV_GEN):
+        assert log(flat[at * xu]) < log(flat[at * xu * GEN])
     return
 
 
 @inline
-def credit_join(e, w, id, base, arg, owner):
+def credit_join(e, w, id, base, att, tops):
     # One contribution of weight g^w to entry e (a g-power index into `flat`):
-    # the entry's base is the maximum of its contributions. The contribution the
-    # entry designates must equal it; any other must not exceed it, by a hinted
-    # difference in two 16-bit limbs (exact: every weight and difference here is
-    # far below the order of g). It records which entry it joined, so the entry's
-    # designation can be checked to name a real contribution to it
-    # (`credit_attained`).
-    owner[id] = e
-    if arg[e] == id:
+    # the entry's base is the maximum of its contributions. The contribution says
+    # whether it is the one that attains it (a hinted flag). If so it must equal
+    # the base, and marks the entry with its id, so no entry has two, nor an empty
+    # entry one; if not, it must not exceed the base, by a hinted difference in two
+    # 16-bit limbs (exact: every weight and difference here is far below the
+    # order of g). `tops` counts the flagged ones along the contribution ids;
+    # with the empty entries they must number the entries, so every entry has
+    # exactly one: every base is attained, and no entry lacks a contribution.
+    top = hint_witness("credit_top")
+    if top == GEN:
         assert w == base[e]
+        att[e] = id
+        tops[id * GEN] = tops[id] * GEN
     else:
+        # Any other flag counts as not the top, the safe side.
         gap = StackBuf(2)
         hint_witness(gap, "credit_gap")  # g^d_lo, g^d_hi
         assert log(gap[0]) < 65536
@@ -3143,15 +3160,16 @@ def credit_join(e, w, id, base, arg, owner):
         for i in unroll(0, 16):
             hi = hi * hi
         assert w * hi * gap[0] == base[e]
+        tops[id * GEN] = tops[id]
     return
 
 
-def credit_sets(counts, flat, starts, base, arg, owner, slot_sets, claim_of, n_occ_g, ids):
+def credit_sets(counts, flat, starts, base, att, tops, slot_sets, claim_of, n_occ_g, ids):
     # Every element of every occurrence of a declared claim j (its published slot
     # and each copy linked to it; omitted claims are shown absent, so these are all)
     # contributes its weight, mapped to this node's payee, to the entry of S_j with
     # that payee, at a hinted position. An occurrence of one element against a set
-    # of one needs no position. `ids` numbers the contributions slot by slot;
+    # of one or two needs no position. `ids` numbers the contributions slot by slot;
     # returns g^(their count).
     ids[1] = 1
     for xs in mul_range(1, n_occ_g):
@@ -3167,30 +3185,30 @@ def credit_sets(counts, flat, starts, base, arg, owner, slot_sets, claim_of, n_o
         first = ids[xs]
         ids[xs * GEN] = first * len_s
         if len_s == GEN:
+            payee = cmap[occ[1]]
             if m_j == GEN:
-                assert set_j[1] == cmap[occ[1]]
-                credit_join(start, occ_w[1], first, base, arg, owner)
+                assert set_j[1] == payee
+                credit_join(start, occ_w[1], first, base, att, tops)
             else:
-                q = hint_witness("credit_pos")
-                assert log(q) < log(m_j)
-                assert set_j[q] == cmap[occ[1]]
-                credit_join(start * q, occ_w[1], first, base, arg, owner)
+                if m_j == GEN * GEN:
+                    # A set of two: the payee is one entry or the other.
+                    if set_j[1] == payee:
+                        credit_join(start, occ_w[1], first, base, att, tops)
+                    else:
+                        assert set_j[GEN] == payee
+                        credit_join(start * GEN, occ_w[1], first, base, att, tops)
+                else:
+                    q = hint_witness("credit_pos")
+                    assert log(q) < log(m_j)
+                    assert set_j[q] == payee
+                    credit_join(start * q, occ_w[1], first, base, att, tops)
         else:
             for xt in mul_range(1, len_s):
                 q = hint_witness("credit_pos")
                 assert log(q) < log(m_j)
                 assert set_j[q] == cmap[occ[xt]]
-                credit_join(start * q, occ_w[xt], first * xt, base, arg, owner)
+                credit_join(start * q, occ_w[xt], first * xt, base, att, tops)
     return ids[n_occ_g]
-
-
-def credit_attained(arg, owner, n_pairs_g):
-    # Each entry's designated contribution is a contribution to that entry, so its
-    # base is attained. The designation is below the contribution count, and every
-    # contribution id below it recorded its entry.
-    for xe in mul_range(1, n_pairs_g):
-        assert owner[arg[xe]] == xe
-    return
 
 
 def fold_share(n_children_g, n_g, g_squares):
@@ -3226,19 +3244,6 @@ def fold_share(n_children_g, n_g, g_squares):
     assert log(rem) < log(n_g)
     assert product * rem == u_g
     return f_g
-
-
-def fold_contributions(n_claims_g, first_g, flat, starts, base, arg, owner):
-    # A fold that merges joins a zero weight to this node's own entry of every
-    # declared SPHINCS claim, so the entry exists even where no occurrence names
-    # this node; its published weight adds the fold's share to its base
-    # (`own_credit_lists`). Payee 0 is the least index, so it leads every set that
-    # holds it.
-    for xj in mul_range(1, n_claims_g):
-        start = starts[xj]
-        assert flat[start] == 1
-        credit_join(start, 1, first_g * xj, base, arg, owner)
-    return
 
 
 def children_distinct(child_pi, n_children_g):
@@ -4068,21 +4073,16 @@ def main():
     # fold's share of its merges.
     children_distinct(child_pi, n_children_g)
     fold_cell = HeapBuf(GEN)
-    own_count = HeapBuf(GEN)
     if n_children_g == 1:
         fold_cell[1] = 1
-        own_count[1] = 1
     else:
         if n_children_g == GEN:
             fold_cell[1] = 1
-            own_count[1] = 1
         else:
             if n_sphincs_g == 1:
                 fold_cell[1] = 1
-                own_count[1] = 1
             else:
                 fold_cell[1] = fold_share(n_children_g, n_sphincs_g, g_squares)
-                own_count[1] = n_sphincs_g
     fold_g = fold_cell[1]
     n_occ_g = n_sphincs_g * n_slink_g
     n_pairs_g = hint_witness("credit_pairs")
@@ -4094,15 +4094,15 @@ def main():
     flat = HeapBuf(n_pairs_g)
     wts = HeapBuf(n_pairs_g)
     base = HeapBuf(n_pairs_g)
-    arg = HeapBuf(n_pairs_g)
-    owner = HeapBuf(n_contrib_g)
-    counts_0, counts_1, flat_0, flat_1, wts_0, wts_1 = own_credit_lists(counts, flat, wts, starts, base, arg, n_sphincs_g, n_pairs_g, n_contrib_g, fold_g, g_squares)
+    att = HeapBuf(n_pairs_g)
+    empties = HeapBuf(n_sphincs_g * GEN)
+    counts_0, counts_1, flat_0, flat_1, wts_0, wts_1, n_empty_g = own_credit_lists(counts, flat, wts, starts, base, att, empties, n_sphincs_g, n_pairs_g, n_contrib_g, fold_g, g_squares)
     ids = HeapBuf(n_occ_g * GEN)
-    occ_total = credit_sets(counts, flat, starts, base, arg, owner, slot_sets, claim_of, n_occ_g, ids)
-    if own_count[1] != 1:
-        fold_contributions(n_sphincs_g, occ_total, flat, starts, base, arg, owner)
-    assert occ_total * own_count[1] == n_contrib_g
-    credit_attained(arg, owner, n_pairs_g)
+    tops = HeapBuf(n_contrib_g * GEN)
+    tops[1] = 1
+    occ_total = credit_sets(counts, flat, starts, base, att, tops, slot_sets, claim_of, n_occ_g, ids)
+    assert occ_total == n_contrib_g
+    assert tops[n_contrib_g] * n_empty_g == n_pairs_g
 
     cr_0, cr_1 = credit_digest(counts_0, counts_1, flat_0, flat_1, wts_0, wts_1, payee_0, payee_1)
     own_0, own_1 = statement_digest(seed_0, seed_1, signers_hash, da_0, da_1, cr_0, cr_1, n_somit_g, defer_stmt)
