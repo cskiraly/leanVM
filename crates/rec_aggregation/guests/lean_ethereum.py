@@ -413,6 +413,10 @@ DA_ROOT_COUNTS = DA_ROOT_COUNTS_PLACEHOLDER
 MAX_RECURSIONS = MAX_RECURSIONS_PLACEHOLDER
 MAX_EPOCHS = MAX_EPOCHS_PLACEHOLDER
 MAX_PAYEES = MAX_PAYEES_PLACEHOLDER
+# Credit weights, in work units: one raw SPHINCS signature proven in a leaf, and
+# one merge of two proofs in a fold.
+LEAF_WEIGHT = LEAF_WEIGHT_PLACEHOLDER
+MERGE_WEIGHT = MERGE_WEIGHT_PLACEHOLDER
 
 
 # ---------------------------------- LeanDA ------------------------------------------
@@ -2817,7 +2821,7 @@ def sphincs_list_digest(entries_ptr, n_g, g_squares):
     return digest[0], digest[1]
 
 
-def child_sphincs_window(state_0, state_1, base, entries_ptr, cover, marks, origin_g, limit_g, x_q, g_squares, sub_counts, sub_starts, sub_flat, credit_map, slot_sets):
+def child_sphincs_window(state_0, state_1, base, entries_ptr, cover, marks, origin_g, limit_g, x_q, g_squares, sub_counts, sub_starts, sub_flat, sub_wts, credit_map, slot_sets):
     # One window of a child's SPHINCS list, absorbed exactly as the child absorbed
     # it, but with each block's claim read at a hinted index into THIS node's table
     # and marked in the coverage table. The index is an offset into the SPHINCS
@@ -2833,7 +2837,7 @@ def child_sphincs_window(state_0, state_1, base, entries_ptr, cover, marks, orig
         off_hint = hint_witness("child_sphincs_index")
         assert log(off_hint) < log(limit_g)  # precondition as in the raw loops
         cover[origin_g * off_hint] = marks * (GEN ** j)
-        carry_set(off_hint, sub_counts[GEN ** j], sub_starts[GEN ** j], sub_flat, credit_map, slot_sets)
+        carry_set(off_hint, sub_counts[GEN ** j], sub_starts[GEN ** j], sub_flat, sub_wts, credit_map, slot_sets)
         entry = entries_ptr * (off_hint ** 4)
         out = StackBuf(2)
         if const(j + 1 == SIGNERS_WINDOW):
@@ -2844,7 +2848,7 @@ def child_sphincs_window(state_0, state_1, base, entries_ptr, cover, marks, orig
     return st[0], st[1], nxt
 
 
-def child_sphincs_tail(state_0, state_1, base, entries_ptr, cover, marks, origin_g, limit_g, sub_counts, sub_starts, sub_flat, credit_map, slot_sets, k: Const):
+def child_sphincs_tail(state_0, state_1, base, entries_ptr, cover, marks, origin_g, limit_g, sub_counts, sub_starts, sub_flat, sub_wts, credit_map, slot_sets, k: Const):
     # The blocks past the child's last whole window, all of them non-final, so every
     # offset stays below this base's lowest set bit.
     st = StackBuf(2)
@@ -2854,7 +2858,7 @@ def child_sphincs_tail(state_0, state_1, base, entries_ptr, cover, marks, origin
         off_hint = hint_witness("child_sphincs_index")
         assert log(off_hint) < log(limit_g)
         cover[origin_g * off_hint] = marks * (GEN ** j)
-        carry_set(off_hint, sub_counts[GEN ** j], sub_starts[GEN ** j], sub_flat, credit_map, slot_sets)
+        carry_set(off_hint, sub_counts[GEN ** j], sub_starts[GEN ** j], sub_flat, sub_wts, credit_map, slot_sets)
         entry = entries_ptr * (off_hint ** 4)
         out = StackBuf(2)
         blake2s(entry[0:2], entry[2:4], out, cv=st, md=base + const(64 * (j + 1)))
@@ -2862,7 +2866,7 @@ def child_sphincs_tail(state_0, state_1, base, entries_ptr, cover, marks, origin
     return st[0], st[1]
 
 
-def child_sphincs_list_digest(entries_ptr, cover, base, origin_g, limit_g, n_g, g_squares, sub_counts, sub_starts, sub_flat, credit_map, slot_sets):
+def child_sphincs_list_digest(entries_ptr, cover, base, origin_g, limit_g, n_g, g_squares, sub_counts, sub_starts, sub_flat, sub_wts, credit_map, slot_sets):
     # BLAKE2s of a child's declared SPHINCS claims, over the same 64n bytes the
     # child hashed (`sphincs_list_digest`), so the digest it rebuilds is the one the
     # child's statement carries. `base` prefixes the coverage write values, which
@@ -2887,7 +2891,7 @@ def child_sphincs_list_digest(entries_ptr, cover, base, origin_g, limit_g, n_g, 
         for xq in mul_range(1, windows):
             slot = chain * (xq ** 4)
             marks = base * (xq ** SIGNERS_WINDOW)
-            s0, s1, nb = child_sphincs_window(slot[1], slot[GEN], slot[GEN ** 2], entries_ptr, cover, marks, origin_g, limit_g, xq, g_squares, sub_counts * (xq ** SIGNERS_WINDOW), sub_starts * (xq ** SIGNERS_WINDOW), sub_flat, credit_map, slot_sets)
+            s0, s1, nb = child_sphincs_window(slot[1], slot[GEN], slot[GEN ** 2], entries_ptr, cover, marks, origin_g, limit_g, xq, g_squares, sub_counts * (xq ** SIGNERS_WINDOW), sub_starts * (xq ** SIGNERS_WINDOW), sub_flat, sub_wts, credit_map, slot_sets)
             step = chain * ((xq * GEN) ** 4)
             step[1] = s0
             step[GEN] = s1
@@ -2896,11 +2900,11 @@ def child_sphincs_list_digest(entries_ptr, cover, base, origin_g, limit_g, n_g, 
         marks = base * (windows ** SIGNERS_WINDOW)
         tail_counts = sub_counts * (windows ** SIGNERS_WINDOW)
         tail_starts = sub_starts * (windows ** SIGNERS_WINDOW)
-        t0, t1 = match(log(tail), range(0, SIGNERS_WINDOW), lambda k: child_sphincs_tail(end[1], end[GEN], end[GEN ** 2], entries_ptr, cover, marks, origin_g, limit_g, tail_counts, tail_starts, sub_flat, credit_map, slot_sets, k))
+        t0, t1 = match(log(tail), range(0, SIGNERS_WINDOW), lambda k: child_sphincs_tail(end[1], end[GEN], end[GEN ** 2], entries_ptr, cover, marks, origin_g, limit_g, tail_counts, tail_starts, sub_flat, sub_wts, credit_map, slot_sets, k))
         off_hint = hint_witness("child_sphincs_index")
         assert log(off_hint) < log(limit_g)
         cover[origin_g * off_hint] = base * (n_g * INV_GEN)
-        carry_set(off_hint, sub_counts[n_g * INV_GEN], sub_starts[n_g * INV_GEN], sub_flat, credit_map, slot_sets)
+        carry_set(off_hint, sub_counts[n_g * INV_GEN], sub_starts[n_g * INV_GEN], sub_flat, sub_wts, credit_map, slot_sets)
         entry = entries_ptr * (off_hint ** 4)
         final = scaled_log(n_g, g_squares, 6) + MD_FINAL
         blake2s(entry[0:2], entry[2:4], digest, cv=[t0, t1], md=final)
@@ -2908,16 +2912,17 @@ def child_sphincs_list_digest(entries_ptr, cover, base, origin_g, limit_g, n_g, 
 
 
 @inline
-def carry_set(off_hint, count, start, sub_flat, credit_map, slot_sets):
+def carry_set(off_hint, count, start, sub_flat, sub_wts, credit_map, slot_sets):
     # A slot's credit set, recorded beside its coverage write: where the set's
-    # cells are, how many, and the map from their payee indices into THIS node's
-    # table (`credit_sets` reads them). A raw signature records {g^0} and the
-    # identity; a child's claim its own set, in the child's indices, with the
-    # child's map.
-    rec = slot_sets * (off_hint ** 3)
+    # payees are, how many, the map from their indices into THIS node's table, and
+    # where their weights are (`credit_sets` reads them). A raw signature records
+    # {g^0} weighing g^LEAF_WEIGHT, with the identity; a child's claim its own set,
+    # in the child's indices, with the child's map.
+    rec = slot_sets * (off_hint ** 4)
     rec[1] = sub_flat * start
     rec[GEN] = count
     rec[GEN ** 2] = credit_map
+    rec[GEN ** 3] = sub_wts * start
     return
 
 
@@ -3030,15 +3035,18 @@ def lane_key(lane):
     return key
 
 
-def credit_lists(counts, flat, starts, n_claims_g, n_pairs_g, n_bound_g, g_squares):
-    # A child's credit sets, one per declared SPHINCS claim, as two hinted cell
-    # runs: `counts`, g^|S_j| a claim, and `flat`, the sets one after another, g^i a
-    # payee. Returns the digests of both. `starts[g^j]` is where set j begins in
-    # `flat`, the prefix products of the counts, which must end at the length of
-    # `flat`. Each set is non-empty and each element is range-checked below
+def credit_lists(counts, flat, wts, starts, n_claims_g, n_pairs_g, n_bound_g, g_squares):
+    # A child's credit sets, one per declared SPHINCS claim, as three hinted cell
+    # runs: `counts`, g^|S_j| a claim; `flat`, the sets' payees one after another,
+    # g^i a payee; and `wts`, parallel to `flat`, g^W the weight of each entry.
+    # Returns the digests of all three. `starts[g^j]` is where set j begins in
+    # `flat` and `wts`, the prefix products of the counts, which must end at the
+    # length of `flat`. Each set is non-empty and each payee is range-checked below
     # `n_bound_g`, the child's table, since this node indexes its map with them.
+    # The weights need no check: the child proved each one a sum of g-powers.
     counts_0, counts_1 = cell_run_digest(counts, n_claims_g, g_squares, 1)
     flat_0, flat_1 = cell_run_digest(flat, n_pairs_g, g_squares, 1)
+    wts_0, wts_1 = cell_run_digest(wts, n_pairs_g, g_squares, 1)
     # The sets partition `flat`, so checking each set's elements checks every cell
     # once. A one-element set, the common case, skips the loop.
     starts[1] = 1
@@ -3055,26 +3063,31 @@ def credit_lists(counts, flat, starts, n_claims_g, n_pairs_g, n_bound_g, g_squar
             for xt in mul_range(1, m):
                 assert log(set_j[xt]) < log(n_bound_g)
     assert starts[n_claims_g] == n_pairs_g
-    return counts_0, counts_1, flat_0, flat_1
+    return counts_0, counts_1, flat_0, flat_1, wts_0, wts_1
 
 
-def credit_digest(counts_0, counts_1, flat_0, flat_1, payee_0, payee_1):
-    # BLAKE2s of the credit lists' two digests and the payee table's: 96 bytes.
+def credit_digest(counts_0, counts_1, flat_0, flat_1, wts_0, wts_1, payee_0, payee_1):
+    # BLAKE2s of the credit lists' three digests and the payee table's: 128 bytes.
     st = StackBuf(2)
     blake2s([counts_0, counts_1], [flat_0, flat_1], st, counter=64)
     digest = StackBuf(2)
-    blake2s([payee_0, payee_1], [0, 0], digest, cv=st, counter=96, final=1)
+    blake2s([wts_0, wts_1], [payee_0, payee_1], digest, cv=st, counter=128, final=1)
     return digest[0], digest[1]
 
 
-def own_credit_lists(counts, flat, starts, n_claims_g, n_pairs_g, slot_sets, claim_of, n_occ_g, g_squares):
-    # This node's credit sets, hashed like a child's (`credit_lists`), with checks
-    # 2 and 3 of `credit_sets` for each set of two or more. Its elements are not
-    # range-checked: each equals a mapped element of an occurrence (checks 1 and
-    # 2), which is a checked index or the 0 of a dropped payee, and a 0 fails the
-    # range check of whoever reads the list (the parent, or the outer verifier).
+def own_credit_lists(counts, flat, wts, starts, base, arg, n_claims_g, n_pairs_g, n_contrib_g, fold_g, g_squares):
+    # This node's credit sets, hinted and hashed like a child's (`credit_lists`),
+    # each set's payees strictly increasing, so one set has one encoding. Their
+    # payees are not range-checked: each equals the mapped payee of a contribution
+    # (`credit_join`), a checked index or the 0 of a dropped payee, and a 0 fails
+    # the range check of whoever reads the list. Each entry also gets a hinted
+    # base, the maximum weight of its contributions, and the id of a contribution
+    # that attains it (below the contribution count). Its published weight is the
+    # base, and for this node's own entry (payee 0) the base times this fold's
+    # share (g^0 when it does not merge).
     counts_0, counts_1 = cell_run_digest(counts, n_claims_g, g_squares, 1)
     flat_0, flat_1 = cell_run_digest(flat, n_pairs_g, g_squares, 1)
+    wts_0, wts_1 = cell_run_digest(wts, n_pairs_g, g_squares, 1)
     starts[1] = 1
     for xj in mul_range(1, n_claims_g):
         m = counts[xj]
@@ -3083,83 +3096,165 @@ def own_credit_lists(counts, flat, starts, n_claims_g, n_pairs_g, slot_sets, cla
         at = starts[xj]
         starts[xj * GEN] = at * m
         if m != GEN:
+            set_j = flat * at
             if m == GEN * GEN:
-                credit_pair_sound(flat * at, xj, slot_sets, claim_of, n_occ_g)
+                assert log(set_j[1]) < log(set_j[GEN])
             else:
-                credit_set_sound(flat * at, m, xj, slot_sets, claim_of, n_occ_g)
+                credit_set_order(set_j, m)
     assert starts[n_claims_g] == n_pairs_g
-    return counts_0, counts_1, flat_0, flat_1
-
-
-def credit_sets(counts, flat, starts, slot_sets, claim_of, n_occ_g):
-    # This node's credit sets are exactly the raw verifiers of its occurrences:
-    # for each declared claim j, S_j is the union of the sets its occurrences carry
-    # (its published slot and every copy linked to it), mapped into this node's
-    # table. Every other occurrence of a declared claim is such a copy, since
-    # omitted claims are shown absent (`absent`).
-    # 1. Complete: every mapped element of every occurrence is in its claim's set,
-    #    at a hinted position. An occurrence of one element against a set of one
-    #    needs no position.
-    for xs in mul_range(1, n_occ_g):
-        xj = claim_of[xs]
-        set_j = flat * starts[xj]
-        m_j = counts[xj]
-        rec = slot_sets * (xs ** 3)
-        occ = rec[1]
-        cmap = rec[GEN ** 2]
-        len_s = rec[GEN]
-        if len_s == GEN:
-            if m_j == GEN:
-                assert set_j[1] == cmap[occ[1]]
-            else:
-                q = hint_witness("credit_pos")
-                assert log(q) < log(m_j)
-                assert set_j[q] == cmap[occ[1]]
+    for xe in mul_range(1, n_pairs_g):
+        b = hint_witness("credit_base")
+        base[xe] = b
+        a = hint_witness("credit_arg")
+        assert log(a) < log(n_contrib_g)
+        arg[xe] = a
+        if flat[xe] == 1:
+            assert wts[xe] == b * fold_g
         else:
-            for xt in mul_range(1, len_s):
-                mapped = cmap[occ[xt]]
-                q = hint_witness("credit_pos")
-                assert log(q) < log(m_j)
-                assert set_j[q] == mapped
-    # 2. Sound and 3. canonical run per set, in `own_credit_lists`
-    #    (`credit_set_sound`). A set of one needs neither: check 1 made every
-    #    element of every occurrence of j equal to it, and the published slot j has
-    #    at least one.
+            assert wts[xe] == b
+    return counts_0, counts_1, flat_0, flat_1, wts_0, wts_1
+
+
+def credit_set_order(set_j, m_j):
+    # A set of three or more, strictly increasing.
+    for xu in mul_range(1, m_j * INV_GEN):
+        assert log(set_j[xu]) < log(set_j[xu * GEN])
     return
 
 
 @inline
-def credit_source(value, xj, slot_sets, claim_of, n_occ_g):
-    # Check 2 for one element of S_j: a hinted slot, an occurrence of claim j, and
-    # an element of that slot's set that maps to it.
-    src = hint_witness("credit_src")
-    elem = hint_witness("credit_src_elem")
-    assert log(src) < log(n_occ_g)
-    assert claim_of[src] == xj
-    rec = slot_sets * (src ** 3)
-    assert log(elem) < log(rec[GEN])
-    occ = rec[1]
-    cmap = rec[GEN ** 2]
-    assert cmap[occ[elem]] == value
+def credit_join(e, w, id, base, arg, owner):
+    # One contribution of weight g^w to entry e (a g-power index into `flat`):
+    # the entry's base is the maximum of its contributions. The contribution the
+    # entry designates must equal it; any other must not exceed it, by a hinted
+    # difference in two 16-bit limbs (exact: every weight and difference here is
+    # far below the order of g). It records which entry it joined, so the entry's
+    # designation can be checked to name a real contribution to it
+    # (`credit_attained`).
+    owner[id] = e
+    if arg[e] == id:
+        assert w == base[e]
+    else:
+        gap = StackBuf(2)
+        hint_witness(gap, "credit_gap")  # g^d_lo, g^d_hi
+        assert log(gap[0]) < 65536
+        assert log(gap[1]) < 65536
+        hi = gap[1]
+        for i in unroll(0, 16):
+            hi = hi * hi
+        assert w * hi * gap[0] == base[e]
     return
 
 
-def credit_pair_sound(set_j, xj, slot_sets, claim_of, n_occ_g):
-    # `credit_set_sound` for a set of two, the common overlap, without loops.
-    credit_source(set_j[1], xj, slot_sets, claim_of, n_occ_g)
-    credit_source(set_j[GEN], xj, slot_sets, claim_of, n_occ_g)
-    assert log(set_j[1]) < log(set_j[GEN])
+def credit_sets(counts, flat, starts, base, arg, owner, slot_sets, claim_of, n_occ_g, ids):
+    # Every element of every occurrence of a declared claim j (its published slot
+    # and each copy linked to it; omitted claims are shown absent, so these are all)
+    # contributes its weight, mapped to this node's payee, to the entry of S_j with
+    # that payee, at a hinted position. An occurrence of one element against a set
+    # of one needs no position. `ids` numbers the contributions slot by slot;
+    # returns g^(their count).
+    ids[1] = 1
+    for xs in mul_range(1, n_occ_g):
+        xj = claim_of[xs]
+        start = starts[xj]
+        set_j = flat * start
+        m_j = counts[xj]
+        rec = slot_sets * (xs ** 4)
+        occ = rec[1]
+        len_s = rec[GEN]
+        cmap = rec[GEN ** 2]
+        occ_w = rec[GEN ** 3]
+        first = ids[xs]
+        ids[xs * GEN] = first * len_s
+        if len_s == GEN:
+            if m_j == GEN:
+                assert set_j[1] == cmap[occ[1]]
+                credit_join(start, occ_w[1], first, base, arg, owner)
+            else:
+                q = hint_witness("credit_pos")
+                assert log(q) < log(m_j)
+                assert set_j[q] == cmap[occ[1]]
+                credit_join(start * q, occ_w[1], first, base, arg, owner)
+        else:
+            for xt in mul_range(1, len_s):
+                q = hint_witness("credit_pos")
+                assert log(q) < log(m_j)
+                assert set_j[q] == cmap[occ[xt]]
+                credit_join(start * q, occ_w[xt], first * xt, base, arg, owner)
+    return ids[n_occ_g]
+
+
+def credit_attained(arg, owner, n_pairs_g):
+    # Each entry's designated contribution is a contribution to that entry, so its
+    # base is attained. The designation is below the contribution count, and every
+    # contribution id below it recorded its entry.
+    for xe in mul_range(1, n_pairs_g):
+        assert owner[arg[xe]] == xe
     return
 
 
-def credit_set_sound(set_j, m_j, xj, slot_sets, claim_of, n_occ_g):
-    # For one set of two or more: 2. sound, every element of S_j is some
-    # occurrence's, at a hinted slot and element, the slot an occurrence of claim
-    # j; 3. canonical, S_j strictly increasing, so one set has one encoding.
-    for xu in mul_range(1, m_j):
-        credit_source(set_j[xu], xj, slot_sets, claim_of, n_occ_g)
-    for xu in mul_range(1, m_j * INV_GEN):
-        assert log(set_j[xu]) < log(set_j[xu * GEN])
+def fold_share(n_children_g, n_g, g_squares):
+    # g^f for this fold's share of its merge work per declared SPHINCS claim,
+    # f = floor((m - 1) * MERGE_WEIGHT / n) for m children and n claims. The
+    # prover hints f in two 16-bit limbs and the remainder r < n; the guest checks
+    # g^(f * n) * g^r = g^((m - 1) * MERGE_WEIGHT), taking g^(f * n) by
+    # square-and-multiply over n's bits (hinted, rebuilt as in `scaled_log`).
+    # f * n + r < 2^48 is far below the order of g, so the exponents are equal as
+    # integers and f is the floor.
+    u_g = (n_children_g * INV_GEN) ** MERGE_WEIGHT
+    limbs = StackBuf(2)
+    hint_witness(limbs, "fold_share")  # g^f_lo, g^f_hi
+    assert log(limbs[0]) < 65536
+    assert log(limbs[1]) < 65536
+    hi = limbs[1]
+    for i in unroll(0, 16):
+        hi = hi * hi
+    f_g = hi * limbs[0]
+    bits = StackBuf(SIGNERS_COUNT_BITS)
+    hint_decompose_bits_exponent(bits, n_g, SIGNERS_COUNT_BITS)
+    rebuilt = GEN ** 0
+    product = GEN ** 0
+    power = f_g
+    for j in unroll(0, SIGNERS_COUNT_BITS):
+        b = bits[j]
+        bits[j] = b * b  # booleanity, as a write-once pin
+        rebuilt *= (1 + b * (g_squares[GEN ** j] + 1))
+        product *= (1 + b * (power + 1))
+        power = power * power
+    assert rebuilt == n_g
+    rem = hint_witness("fold_rem")
+    assert log(rem) < log(n_g)
+    assert product * rem == u_g
+    return f_g
+
+
+def fold_contributions(n_claims_g, first_g, flat, starts, base, arg, owner):
+    # A fold that merges joins a zero weight to this node's own entry of every
+    # declared SPHINCS claim, so the entry exists even where no occurrence names
+    # this node; its published weight adds the fold's share to its base
+    # (`own_credit_lists`). Payee 0 is the least index, so it leads every set that
+    # holds it.
+    for xj in mul_range(1, n_claims_g):
+        start = starts[xj]
+        assert flat[start] == 1
+        credit_join(start, 1, first_g * xj, base, arg, owner)
+    return
+
+
+def children_distinct(child_pi, n_children_g):
+    # No proof is folded twice: every ordered pair of children differs in a hinted
+    # cell of their statements.
+    for xa in mul_range(1, n_children_g):
+        for xb in mul_range(1, n_children_g):
+            if xa != xb:
+                a = child_pi * (xa * xa)
+                b = child_pi * (xb * xb)
+                sel = hint_witness("child_distinct")
+                if sel == 1:
+                    assert a[1] != b[1]
+                else:
+                    assert sel == GEN
+                    assert a[GEN] != b[GEN]
     return
 
 
@@ -3694,9 +3789,12 @@ def main():
     assert n_payees_g != 1
     payees = HeapBuf(n_payees_g * n_payees_g)
     payee_0, payee_1 = cell_run_digest(payees, n_payees_g * n_payees_g, g_squares, 1)
-    # A raw signature's set, {this node}, and the map that leaves it alone.
+    # A raw signature's set, {this node}, its weight, and the map that leaves it
+    # alone.
     raw_set = HeapBuf(GEN)
     raw_set[1] = 1
+    raw_weight = HeapBuf(GEN)
+    raw_weight[1] = GEN ** LEAF_WEIGHT
     identity = HeapBuf(GEN)
     identity[1] = 1
 
@@ -3725,7 +3823,7 @@ def main():
     # declared slot is the prover's choice and does not matter: the linked copies
     # below tie every other occurrence to the slot, and `credit_sets` takes the
     # union over all of them.
-    slot_sets = HeapBuf(sphincs_slots_g ** 3)
+    slot_sets = HeapBuf(sphincs_slots_g ** 4)
     # The run the set's hash covers: both lengths and the SPHINCS list's digest
     # in one block, then two a group. Eight cells a group, so a group's
     # header and its key digest are one block each.
@@ -3836,10 +3934,11 @@ def main():
         off_hint = hint_witness("sp_raw_index")
         assert log(off_hint) < log(sphincs_slots_g)
         cover[xmss_slots_g * off_hint] = n_raw_x_g * xj
-        rec = slot_sets * (off_hint ** 3)  # a raw signature credits this node, payee 0
+        rec = slot_sets * (off_hint ** 4)  # a raw signature credits this node, payee 0
         rec[1] = raw_set
         rec[GEN] = GEN
         rec[GEN ** 2] = identity
+        rec[GEN ** 3] = raw_weight
         verify_sig_sphincs(sphincs_table * (off_hint ** 4))
 
     if n_direct_da_g == GEN:
@@ -3890,9 +3989,10 @@ def main():
         sub_counts = HeapBuf(nsub_s_g)
         sub_starts = HeapBuf(nsub_s_g * GEN)
         sub_flat = HeapBuf(nsub_pairs_g)
-        sc_0, sc_1, sf_0, sf_1 = credit_lists(sub_counts, sub_flat, sub_starts, nsub_s_g, nsub_pairs_g, nsub_p_g, g_squares)
-        sub_cr_0, sub_cr_1 = credit_digest(sc_0, sc_1, sf_0, sf_1, sub_payee_0, sub_payee_1)
-        csp_0, csp_1 = child_sphincs_list_digest(sphincs_table, cover, base * nsub_x_g, xmss_slots_g, sphincs_slots_g, nsub_s_g, g_squares, sub_counts, sub_starts, sub_flat, credit_map, slot_sets)
+        sub_wts = HeapBuf(nsub_pairs_g)
+        sc_0, sc_1, sf_0, sf_1, sw_0, sw_1 = credit_lists(sub_counts, sub_flat, sub_wts, sub_starts, nsub_s_g, nsub_pairs_g, nsub_p_g, g_squares)
+        sub_cr_0, sub_cr_1 = credit_digest(sc_0, sc_1, sf_0, sf_1, sw_0, sw_1, sub_payee_0, sub_payee_1)
+        csp_0, csp_1 = child_sphincs_list_digest(sphincs_table, cover, base * nsub_x_g, xmss_slots_g, sphincs_slots_g, nsub_s_g, g_squares, sub_counts, sub_starts, sub_flat, sub_wts, credit_map, slot_sets)
         sub_run[GEN ** 2] = csp_0
         sub_run[GEN ** 3] = csp_1
         sub_set_0, sub_set_1 = signer_set_digest(sub_run, nsub_e_g, g_squares)
@@ -3962,18 +4062,49 @@ def main():
         claim_of[xj] = xj
     for xd in mul_range(1, n_slink_g):
         claim_of[n_sphincs_g * xd] = links[xd]
-    # This node's credit sets, one a declared SPHINCS claim, hinted, and proven the
-    # union of the raw verifiers of each claim's occurrences.
+    # This node's credit sets, one a declared SPHINCS claim, hinted, and proven:
+    # each entry's weight is the maximum over the contributions of its payee, from
+    # the claim's occurrences, plus, for this node in a fold that merges, the
+    # fold's share of its merges.
+    children_distinct(child_pi, n_children_g)
+    fold_cell = HeapBuf(GEN)
+    own_count = HeapBuf(GEN)
+    if n_children_g == 1:
+        fold_cell[1] = 1
+        own_count[1] = 1
+    else:
+        if n_children_g == GEN:
+            fold_cell[1] = 1
+            own_count[1] = 1
+        else:
+            if n_sphincs_g == 1:
+                fold_cell[1] = 1
+                own_count[1] = 1
+            else:
+                fold_cell[1] = fold_share(n_children_g, n_sphincs_g, g_squares)
+                own_count[1] = n_sphincs_g
+    fold_g = fold_cell[1]
     n_occ_g = n_sphincs_g * n_slink_g
     n_pairs_g = hint_witness("credit_pairs")
     assert log(n_pairs_g) < MAX_KEYS
+    n_contrib_g = hint_witness("credit_total")
+    assert log(n_contrib_g) < MAX_KEYS
     counts = HeapBuf(n_sphincs_g)
     starts = HeapBuf(n_sphincs_g * GEN)
     flat = HeapBuf(n_pairs_g)
-    counts_0, counts_1, flat_0, flat_1 = own_credit_lists(counts, flat, starts, n_sphincs_g, n_pairs_g, slot_sets, claim_of, n_occ_g, g_squares)
-    credit_sets(counts, flat, starts, slot_sets, claim_of, n_occ_g)
+    wts = HeapBuf(n_pairs_g)
+    base = HeapBuf(n_pairs_g)
+    arg = HeapBuf(n_pairs_g)
+    owner = HeapBuf(n_contrib_g)
+    counts_0, counts_1, flat_0, flat_1, wts_0, wts_1 = own_credit_lists(counts, flat, wts, starts, base, arg, n_sphincs_g, n_pairs_g, n_contrib_g, fold_g, g_squares)
+    ids = HeapBuf(n_occ_g * GEN)
+    occ_total = credit_sets(counts, flat, starts, base, arg, owner, slot_sets, claim_of, n_occ_g, ids)
+    if own_count[1] != 1:
+        fold_contributions(n_sphincs_g, occ_total, flat, starts, base, arg, owner)
+    assert occ_total * own_count[1] == n_contrib_g
+    credit_attained(arg, owner, n_pairs_g)
 
-    cr_0, cr_1 = credit_digest(counts_0, counts_1, flat_0, flat_1, payee_0, payee_1)
+    cr_0, cr_1 = credit_digest(counts_0, counts_1, flat_0, flat_1, wts_0, wts_1, payee_0, payee_1)
     own_0, own_1 = statement_digest(seed_0, seed_1, signers_hash, da_0, da_1, cr_0, cr_1, n_somit_g, defer_stmt)
     pub_ptr = GEN ** 0
     assert pub_ptr[1] == own_0

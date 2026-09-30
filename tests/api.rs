@@ -87,7 +87,9 @@ fn public_api_end_to_end() {
         } else {
             RIGHT
         };
-        assert!(received.sphincs_payees(i).eq([&verifier]));
+        // The raw verifier, and the root, which merged two children, for its share.
+        let payees: Vec<_> = received.sphincs_payees(i).map(|(p, _)| *p).collect();
+        assert_eq!(payees, [ROOT, verifier]);
     }
 
     // 5. Removing some signatures from the aggregate: `declare` is what we keep. Here the first group goes whole.
