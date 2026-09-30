@@ -299,7 +299,8 @@ AGG_SEED_0 = AGG_SEED_0_PLACEHOLDER
 AGG_SEED_1 = AGG_SEED_1_PLACEHOLDER
 # The statement digest's preimage: the STMT_HEADER header values as the 16-byte
 # cells they already are (the seed, the signer-set digest, which itself binds
-# the epoch groups and every count, the DA list digest and the credit digest),
+# the epoch groups and every count, the DA list digest, the credit digest, the
+# omitted count and the fold share),
 # then the deferred cells' tower limbs, two to
 # a cell and four cells to a 64-byte block. No domain tag: the seed leads, and it
 # binds this bytecode and flock's R1CS.
@@ -2505,11 +2506,12 @@ def verify_sig_sphincs(signer):
 # =========================== statements and the signer set ==========================
 
 
-def statement_digest(seed_0, seed_1, signers_hash, da_0, da_1, cr_0, cr_1, omitted_g, defer):
+def statement_digest(seed_0, seed_1, signers_hash, da_0, da_1, cr_0, cr_1, omitted_g, fold_g, defer):
     # A node's statement, hashed to the two words the VM publishes, over the
     # proving environment's Fiat-Shamir seed (flock's R1CS and this bytecode), the
     # two-cell signer-set digest, the digest of its possibly empty DA root list,
-    # its credit digest, g^(its omitted SPHINCS slots), and the DEFER_STMT_CELLS
+    # its credit digest, g^(its omitted SPHINCS slots), g^(its fold share, the
+    # weight its own credits gained in this fold), and the DEFER_STMT_CELLS
     # deferred-claim cells. A
     # parent rebuilds a child's statement with this same call, over a signer-set
     # digest it re-absorbed itself, which forces the child to be a proof of THIS
@@ -2530,6 +2532,7 @@ def statement_digest(seed_0, seed_1, signers_hash, da_0, da_1, cr_0, cr_1, omitt
     cells[6] = cr_0
     cells[7] = cr_1
     cells[8] = omitted_g
+    cells[9] = fold_g
     for p in unroll(0, STMT_PAIRS):
         s = defer[GEN ** (2 * p)]
         if const(2 * p + 1 == DEFER_STMT_CELLS):
@@ -3140,11 +3143,18 @@ def credit_join(e, w, id, base, att, tops):
     # the entry's base is the maximum of its contributions. The contribution says
     # whether it is the one that attains it (a hinted flag). If so it must equal
     # the base, and marks the entry with its id, so no entry has two, nor an empty
-    # entry one; if not, it must not exceed the base, by a hinted difference in two
-    # 16-bit limbs (exact: every weight and difference here is far below the
-    # order of g). `tops` counts the flagged ones along the contribution ids;
-    # with the empty entries they must number the entries, so every entry has
-    # exactly one: every base is attained, and no entry lacks a contribution.
+    # entry one; if not, it must not exceed the base, by a hinted difference in
+    # three 16-bit limbs, below 2^48 like every weight the root accepts. `tops`
+    # counts the flagged ones along the contribution ids; with the empty entries
+    # they must number the entries, so every entry has exactly one: every base is
+    # attained, and no entry lacks a contribution.
+    #
+    # Exact while every weight stays below the order of g, which no fold checks:
+    # a weight starts at LEAF_WEIGHT and a fold raises a maximum by at most its
+    # share, below (MAX_RECURSIONS - 1) * MERGE_WEIGHT < 2^21. A weight that
+    # wraps, the one way to pass a large maximum off as a small one, takes more
+    # than 2^43 folds in sequence on one claim's path: a bound on work, not a
+    # check.
     top = hint_witness("credit_top")
     if top == GEN:
         assert w == base[e]
@@ -3152,11 +3162,15 @@ def credit_join(e, w, id, base, att, tops):
         tops[id * GEN] = tops[id] * GEN
     else:
         # Any other flag counts as not the top, the safe side.
-        gap = StackBuf(2)
-        hint_witness(gap, "credit_gap")  # g^d_lo, g^d_hi
+        gap = StackBuf(3)
+        hint_witness(gap, "credit_gap")  # g^d_lo, g^d_mid, g^d_hi
         assert log(gap[0]) < 65536
         assert log(gap[1]) < 65536
-        hi = gap[1]
+        assert log(gap[2]) < 65536
+        hi = gap[2]
+        for i in unroll(0, 16):
+            hi = hi * hi
+        hi = hi * gap[1]
         for i in unroll(0, 16):
             hi = hi * hi
         assert w * hi * gap[0] == base[e]
@@ -4019,7 +4033,8 @@ def main():
         child_da_0, child_da_1 = da_list_digest(child_da, nsub_da_g)
         # Only rebuilt: nothing here depends on whether the child omitted.
         sub_omitted_g = hint_witness("child_omitted")
-        pi_0, pi_1 = statement_digest(seed_0, seed_1, sub_hash, child_da_0, child_da_1, sub_cr_0, sub_cr_1, sub_omitted_g, carried)
+        sub_fold_g = hint_witness("child_fold")
+        pi_0, pi_1 = statement_digest(seed_0, seed_1, sub_hash, child_da_0, child_da_1, sub_cr_0, sub_cr_1, sub_omitted_g, sub_fold_g, carried)
         pi = xc * xc
         child_pi[pi] = pi_0
         child_pi[pi * GEN] = pi_1
@@ -4105,7 +4120,7 @@ def main():
     assert tops[n_contrib_g] * n_empty_g == n_pairs_g
 
     cr_0, cr_1 = credit_digest(counts_0, counts_1, flat_0, flat_1, wts_0, wts_1, payee_0, payee_1)
-    own_0, own_1 = statement_digest(seed_0, seed_1, signers_hash, da_0, da_1, cr_0, cr_1, n_somit_g, defer_stmt)
+    own_0, own_1 = statement_digest(seed_0, seed_1, signers_hash, da_0, da_1, cr_0, cr_1, n_somit_g, fold_g, defer_stmt)
     pub_ptr = GEN ** 0
     assert pub_ptr[1] == own_0
     assert pub_ptr[GEN] == own_1

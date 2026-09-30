@@ -81,16 +81,26 @@ fn public_api_end_to_end() {
         .map(|group| (group.epoch, group.message))
         .collect();
     assert_eq!(pairs, vec![(EPOCH_A, MSG_0), (EPOCH_A, MSG_1), (EPOCH_B, MSG_2)]);
+    // The root merged two children: one merge, shared over its SPHINCS claims.
+    let share = MERGE_WEIGHT / received.sphincs_signers().len() as u64;
     for (i, &(pk, message)) in received.sphincs_signers().iter().enumerate() {
         let verifier = if (pk, message) == (sphincs_input[0].0, sphincs_input[0].1) {
             LEFT
         } else {
             RIGHT
         };
-        // The raw verifier, and the root, which merged two children, for its share.
-        let payees: Vec<_> = received.sphincs_payees(i).map(|(p, _)| *p).collect();
-        assert_eq!(payees, [ROOT, verifier]);
+        // The raw verifier, and the root for its share.
+        let payees: Vec<_> = received.sphincs_payees(i).map(|(p, w)| (*p, w)).collect();
+        assert_eq!(payees, [(ROOT, share), (verifier, LEAF_WEIGHT)]);
+        assert_eq!(
+            received.sphincs_credits()[i][0],
+            Credit {
+                payee: 0,
+                weight: share
+            }
+        );
     }
+    assert_eq!(u64::from(received.fold_share()), share);
 
     // 5. Removing some signatures from the aggregate: `declare` is what we keep. Here the first group goes whole.
     let mut groups = received.xmss_signers().to_vec();

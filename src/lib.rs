@@ -5,9 +5,9 @@
 //! End to end in [`tests/api.rs`](https://github.com/leanEthereum/leanVM/blob/main/tests/api.rs).
 
 pub use rec_aggregation::{
-    AggregateVerifyError, AggregationError, ClaimSelection, DA_LOG_CELL, DA_LOG_K, DA_MAX_ROWS, EthereumProof,
-    MAX_DA_ROOTS, MAX_EPOCHS, MAX_KEYS, MAX_PAYEES, MAX_RECURSIONS, Payee, SignatureClaims, SphincsClaim,
-    XmssClaimGroup, aggregate,
+    AggregateVerifyError, AggregationError, ClaimSelection, Credit, DA_LOG_CELL, DA_LOG_K, DA_MAX_ROWS, EthereumProof,
+    LEAF_WEIGHT, MAX_DA_ROOTS, MAX_EPOCHS, MAX_KEYS, MAX_PAYEES, MAX_RECURSIONS, MERGE_WEIGHT, Payee, SignatureClaims,
+    SphincsClaim, XmssClaimGroup, aggregate,
 };
 
 pub use lean_vm::{

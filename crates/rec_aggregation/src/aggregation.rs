@@ -307,10 +307,11 @@ fn cell_run_split(n: usize) -> Vec<F192> {
     ]
 }
 
-/// The credit digest the statement carries: BLAKE2s of the credit sets' two lists (the set sizes, then the sets one after
-/// another, each cell `g^i`) and of the payee table (two cells a payee), 96 bytes,
-/// as the guest's `credit_lists` and `credit_digest` hash them. Each list hash
-/// binds its own length, and the sizes split the sets.
+/// The credit digest the statement carries: BLAKE2s of the credit sets' three
+/// lists (the set sizes; the entries' payees, the sets one after another, each
+/// cell `g^i`; and their weights, `g^W` a cell) and of the payee table (two cells a
+/// payee), 128 bytes, as the guest's `credit_lists` and `credit_digest` hash them.
+/// Each list hash binds its own length, and the sizes split the sets.
 fn credit_digest(payees: &[Payee], credits: &[Vec<Credit>]) -> [F192; 2] {
     let counts = cell_run_digest(credits.iter().map(|set| count(set.len())));
     let flat = cell_run_digest(credits.iter().flatten().map(|c| count(c.payee.into())));
@@ -517,9 +518,10 @@ impl DeferredClaim {
 
 /// The statement's fixed header, ahead of the deferred cells: the seed, the
 /// signer-set digest (which itself binds the epoch groups and every count), the
-/// DA root-list digest, the credit digest, and the omitted SPHINCS slot count (in
-/// the exponent). Fed to the guest as `STMT_HEADER`, so the two cannot drift.
-const STATEMENT_HEADER: usize = 9;
+/// DA root-list digest, the credit digest, the omitted SPHINCS slot count and the
+/// fold share (both in the exponent). Fed to the guest as `STMT_HEADER`, so the two
+/// cannot drift.
+const STATEMENT_HEADER: usize = 10;
 
 /// A plain BLAKE2s over a lane stream, zero-filled to a whole 64-byte block:
 /// what the guest gets by streaming four 128-bit cells a block.
@@ -546,6 +548,7 @@ fn statement_digest(
     da_digest: [u8; 32],
     credit_digest: [F192; 2],
     sphincs_omitted: u16,
+    fold_share: u32,
     defer: &DeferredClaim,
 ) -> [F192; 2] {
     let seed = lean_vm::cpu::fs_seed(unified_guest());
@@ -560,6 +563,7 @@ fn statement_digest(
         credit_digest[0],
         credit_digest[1],
         count(sphincs_omitted.into()),
+        count(fold_share as usize),
     ];
     assert_eq!(header.len(), STATEMENT_HEADER);
     let mut cells = defer.cells();
@@ -595,7 +599,8 @@ struct DeferredSubproof {
 /// [`Self::da_commitments`] also attests that the committed blob rows are valid Reed-Solomon codewords.
 /// These claims can be established directly or carried from verified child proofs.
 /// Each SPHINCS claim also names, in [`Self::sphincs_credits`], the payees of the
-/// nodes that verified its signature raw, carried through the folds.
+/// nodes that did work for it, verifying its signature raw or folding it, each with
+/// a weight, carried through the folds.
 ///
 /// The two lists describe the signature claims and remain separate because the proof says which scheme
 /// verified which key (the module docs give the coverage argument). Until
@@ -619,12 +624,15 @@ pub struct EthereumProof {
     /// Entry 0 is the payee of whoever proved this aggregate; the rest, strictly
     /// sorted and distinct from it, are payees its children credited.
     payees: Vec<Payee>,
-    /// One set of indices into [`Self::payees`] per SPHINCS claim, aligned with
-    /// [`Self::sphincs_signers`], strictly increasing: every payee that verified
-    /// that claim raw anywhere in the folded tree.
+    /// One set of credits per SPHINCS claim, aligned with
+    /// [`Self::sphincs_signers`], strictly increasing by payee index into
+    /// [`Self::payees`]: every payee that did work for that claim in the folded
+    /// tree, with its weight.
     sphincs_credits: Vec<Vec<Credit>>,
     /// How many SPHINCS claims the last fold covered without publishing them.
     sphincs_omitted: u16,
+    /// The weight the last fold added to its own credit for each claim.
+    fold_share: u32,
     /// What this aggregate defers to whoever discharges it: its parent, in
     /// circuit, or [`Self::verify`], natively.
     defer: DeferredClaim,
@@ -668,7 +676,9 @@ pub enum AggregationError {
     MalformedRawSignature,
     /// More than [`MAX_RECURSIONS`] children, or [`MAX_KEYS`] signers or more
     /// once the duplicate slots are counted, or more than [`MAX_DA_ROOTS`] DA roots,
-    /// or more than [`MAX_PAYEES`] payees credited.
+    /// or more than [`MAX_PAYEES`] payees credited, or [`MAX_KEYS`] credits or
+    /// more, published or read from the SPHINCS occurrences, or a credit weight of
+    /// 2^48 or more.
     TooLarge,
     /// The payload has a partial row or exceeds [`DA_MAX_ROWS`].
     InvalidBlobSize { symbols: usize },
@@ -754,6 +764,7 @@ type WireCore = (
     Vec<Payee>,
     Vec<Vec<Credit>>,
     u16,
+    u32,
     Vec<[u8; 32]>,
     Vec<F192>,
     Vec<F192>,
@@ -863,6 +874,7 @@ impl EthereumProof {
             self.da_commitments_digest(),
             credit_digest(&self.payees, &self.sphincs_credits),
             self.sphincs_omitted,
+            self.fold_share,
             &self.defer,
         )
     }
@@ -873,12 +885,18 @@ impl EthereumProof {
         &self.payees
     }
 
-    /// One set of indices into [`Self::payees`] per claim of
-    /// [`Self::sphincs_signers`], strictly increasing: the payees of every node that
-    /// verified that claim's signature raw, over every path of folds on which the
-    /// claim stayed published. A fold that omits the claim drops the credits below
-    /// it: if the claim returns later through another proof, only that proof's come
-    /// with it. Like the lists, a claim until [`Self::verify`] returns `Ok`.
+    /// One set of credits per claim of [`Self::sphincs_signers`], strictly
+    /// increasing by payee index into [`Self::payees`]: every node that did work for
+    /// that claim, over every path of folds on which the claim stayed published.
+    /// A node that verified its signature raw weighs [`LEAF_WEIGHT`]; a fold of `m >= 2`
+    /// children adds its share of `(m - 1)` merges, `floor((m - 1) · MERGE_WEIGHT /
+    /// n)` over its `n` SPHINCS claims ([`Self::fold_share`]), to its own credit.
+    /// Each payee weighs the most any one path gives it, plus that share: work
+    /// that reaches a fold twice counts once. A fold may leave its own credit out,
+    /// waiving its share, but cannot drop, add or reweigh another's. A fold that
+    /// omits the claim drops the credits below it: if the claim returns later
+    /// through another proof, only that proof's come with it. Like the lists, a
+    /// claim until [`Self::verify`] returns `Ok`.
     pub fn sphincs_credits(&self) -> &[Vec<Credit>] {
         &self.sphincs_credits
     }
@@ -897,6 +915,16 @@ impl EthereumProof {
     /// below.
     pub fn sphincs_omitted(&self) -> u16 {
         self.sphincs_omitted
+    }
+
+    /// The weight the fold that produced this aggregate added to its own credit
+    /// (payee 0) for each claim it credits itself on: `floor((m - 1) ·
+    /// MERGE_WEIGHT / n)` for `m` children and `n` SPHINCS claims, 0 for a fold of
+    /// fewer than two children. A payout that excludes the last fold's work
+    /// subtracts this from payee 0's weights; payee 0's earlier work, as a raw
+    /// verifier or an earlier folder on the claim's path, stays in them.
+    pub fn fold_share(&self) -> u32 {
+        self.fold_share
     }
 
     /// Strictly increasing `(epoch, message)` pairs, each group non-empty and
@@ -934,7 +962,7 @@ impl EthereumProof {
     }
 
     /// The wire format: the signer set (each group with its epoch and
-    /// message), the payee table and credits, the omitted count, the DA root list, the two deferred points, and the VM proof. The claim *values* are not transmitted;
+    /// message), the payee table and credits, the omitted count, the fold share, the DA root list, the two deferred points, and the VM proof. The claim *values* are not transmitted;
     /// [`Self::from_bytes`] recomputes them, so there is nothing to lie about.
     pub fn to_bytes(&self) -> Vec<u8> {
         wire()
@@ -978,6 +1006,7 @@ impl EthereumProof {
         &[Payee],
         &[Vec<Credit>],
         u16,
+        u32,
         &[[u8; 32]],
         &[F192],
         &[F192],
@@ -987,6 +1016,7 @@ impl EthereumProof {
             &self.payees,
             &self.sphincs_credits,
             self.sphincs_omitted,
+            self.fold_share,
             &self.da_roots,
             &self.defer.bytecode_point,
             &self.defer.matrix_point,
@@ -999,7 +1029,8 @@ impl EthereumProof {
             xmss: xmss_signers,
             sphincs: sphincs_signers,
         } = keys;
-        let (payees, sphincs_credits, sphincs_omitted, da_roots, bytecode_point, matrix_point, proof) = core;
+        let (payees, sphincs_credits, sphincs_omitted, fold_share, da_roots, bytecode_point, matrix_point, proof) =
+            core;
         // Cheap rejections first. `recompute` below is a pass over the whole stacked
         // bytecode plus a walk of the BLAKE2s circuit, on points a peer chose, so
         // anything decidable without it has to be decided before it.
@@ -1013,6 +1044,7 @@ impl EthereumProof {
             payees,
             sphincs_credits,
             sphincs_omitted,
+            fold_share,
             // The wire carries no value, only the points to derive it from.
             defer: DeferredClaim::recompute(bytecode_point, matrix_point)?,
             proof,
@@ -1032,9 +1064,10 @@ impl EthereumProof {
     /// expects particular pairs has to check the two lists against them. Every root in
     /// [`Self::da_commitments`] also attests to a well-formed blob matrix; callers check
     /// that this list contains the commitments they require. Each SPHINCS claim's
-    /// credits name the nodes that verified its signature raw, as each node's prover
-    /// chose to name itself: all of them, along the paths on which the claim stayed
-    /// published, and no other ([`Self::sphincs_credits`]).
+    /// credits name the nodes that did work for it, as each node's prover chose to
+    /// name itself: every raw verifier along the paths on which the claim stayed
+    /// published, and no other, with the folders along them that took their share
+    /// of the merges ([`Self::sphincs_credits`]).
     pub fn verify(&self) -> Result<(), AggregateVerifyError> {
         check_signer_set(&self.xmss_signers, &self.sphincs_signers)?;
         check_credits(&self.payees, &self.sphincs_credits, self.sphincs_signers.len())?;
@@ -2258,24 +2291,25 @@ fn occurrence_credits(cover: &Coverage, children: &[EthereumProof], payee: Payee
 /// twice counts once), plus this node's `fold` share on its own entry. The table is `payee`, then every other payee a declared
 /// claim credits, sorted, so each set, in table indices, is sorted too; a child's
 /// payee that no declared claim names is dropped, its map entry 0.
+///
+/// The guest numbers the occurrences' credits below [`MAX_KEYS`] and takes each
+/// difference to a maximum in three 16-bit limbs, so both are bounded here:
+/// [`MAX_KEYS`] credits read, and weights below 2^48 (the inherited ones are, by
+/// the children's own checks).
 fn plan_credits(
     occurrences: &[Vec<(Payee, u64)>],
-    cover: &Coverage,
+    claim_of: &[usize],
+    n_sphincs: usize,
     payee: Payee,
     fold: Option<u64>,
 ) -> Result<(Vec<Payee>, Vec<Vec<Credit>>), AggregationError> {
-    let n_sphincs = cover.sphincs_signers.len();
-    let claim_of = |slot: usize| {
-        if slot < n_sphincs {
-            slot
-        } else {
-            cover.sphincs_links[slot - n_sphincs]
-        }
-    };
+    if occurrences.iter().map(Vec::len).sum::<usize>() >= MAX_KEYS {
+        return Err(AggregationError::TooLarge);
+    }
     let mut credited: Vec<BTreeMap<Payee, u64>> = vec![BTreeMap::new(); n_sphincs];
     for (slot, set) in occurrences.iter().enumerate() {
         for &(p, w) in set {
-            let at = credited[claim_of(slot)].entry(p).or_default();
+            let at = credited[claim_of[slot]].entry(p).or_default();
             *at = (*at).max(w);
         }
     }
@@ -2291,7 +2325,10 @@ fn plan_credits(
         .copied()
         .collect();
     let payees: Vec<Payee> = std::iter::once(payee).chain(others).collect();
-    if payees.len() > MAX_PAYEES || credited.iter().map(BTreeMap::len).sum::<usize>() >= MAX_KEYS {
+    if payees.len() > MAX_PAYEES
+        || credited.iter().map(BTreeMap::len).sum::<usize>() >= MAX_KEYS
+        || credited.iter().flat_map(BTreeMap::values).any(|&w| w >= 1 << 48)
+    {
         return Err(AggregationError::TooLarge);
     }
     let index: BTreeMap<Payee, u16> = payees.iter().enumerate().map(|(i, p)| (*p, i as u16)).collect();
@@ -2316,7 +2353,7 @@ fn plan_credits(
 /// numbered in the guest's order: per occurrence slot, per element (with its
 /// position in its claim's set, none for one element against a set of one or
 /// two). Each contribution that does not attain its entry's maximum gets the
-/// difference in two 16-bit limbs; each entry gets the id of the first
+/// difference in three 16-bit limbs; each entry gets the id of the first
 /// contribution that attains its maximum (the contribution count for this node's
 /// entry when nothing contributes to it), and this node's entries their base.
 /// Then the fold share's limbs and remainder, and the contribution count.
@@ -2371,7 +2408,7 @@ fn push_credit_set_hints(
 
 /// The guest's `credit_join` and `own_credit_lists` hints for the maximum:
 /// per contribution (entry, weight), whether it is the first to attain its
-/// entry's `base`, and if not the difference in two 16-bit limbs (`gap`
+/// entry's `base`, and if not the difference in three 16-bit limbs (`gap`
 /// overrides a contribution's limbs, for tests); then per claim whose set leads
 /// with this node, that entry's base and whether it is empty.
 fn push_join_hints(
@@ -2380,7 +2417,7 @@ fn push_join_hints(
     starts: &[usize],
     contributions: &[(usize, u64)],
     base: &[u64],
-    gap: &[(usize, [F192; 2])],
+    gap: &[(usize, [F192; 3])],
 ) {
     let top: Vec<Option<usize>> = (0..base.len())
         .map(|e| contributions.iter().position(|&(f, w)| f == e && w == base[e]))
@@ -2390,11 +2427,10 @@ fn push_join_hints(
             hints.push("credit_top", vec![count(1)]);
         } else {
             hints.push("credit_top", vec![count(0)]);
-            let d = base[e].wrapping_sub(w) & 0xffff_ffff;
-            let limbs = gap.iter().find(|(g, _)| *g == id).map_or(
-                vec![count((d & 0xffff) as usize), count((d >> 16) as usize)],
-                |(_, l)| l.to_vec(),
-            );
+            let limbs = gap
+                .iter()
+                .find(|(g, _)| *g == id)
+                .map_or_else(|| gap_limbs(base[e] - w).to_vec(), |(_, l)| l.to_vec());
             hints.push("credit_gap", limbs);
         }
     }
@@ -2405,6 +2441,13 @@ fn push_join_hints(
             hints.push("credit_empty", vec![count(usize::from(top[e].is_none()))]);
         }
     }
+}
+
+/// A difference below 2^48 as the guest's `credit_join` takes it: three 16-bit
+/// limbs, `g^` each, lowest first.
+fn gap_limbs(d: u64) -> [F192; 3] {
+    assert!(d < 1 << 48, "a difference between weights below 2^48");
+    [0, 16, 32].map(|at| count(((d >> at) & 0xffff) as usize))
 }
 
 /// The guest's `children_distinct` hints: for every ordered pair of distinct
@@ -2629,15 +2672,21 @@ pub(crate) fn aggregate_with_stats(
     )
 }
 
+/// The statement's header counts, for [`aggregate_tampered`]'s hook to lie about.
+pub(crate) struct HeaderCounts {
+    sphincs_omitted: u16,
+    fold_share: u32,
+}
+
 /// [`aggregate`], with a hook to corrupt the witness before proving.
 ///
 /// The coverage argument and the claim batching are enforced entirely by guest
 /// asserts over prover advice, so the only way to test them is to lie in a hint
 /// and require the guest to notice. That is what `tamper` is for
 /// (`aggregate_hints_bind`); with an empty hook this is the production path. It
-/// also gets the payee table, credits and omitted count the statement will
-/// publish, since a lie about those only means something when the statement tells
-/// the same lie.
+/// also gets the payee table, credits, omitted count and fold share the statement
+/// will publish, since a lie about those only means something when the statement
+/// tells the same lie.
 pub(crate) fn aggregate_tampered(
     children: &[EthereumProof],
     raw_xmss: Vec<(XmssPublicKey, xmss::Epoch, xmss::Message, XmssSignature)>,
@@ -2646,7 +2695,7 @@ pub(crate) fn aggregate_tampered(
     da_input: DaInput<'_>,
     payee: Payee,
     log_inv_rate: usize,
-    tamper: impl FnOnce(&mut Hints, &mut Vec<Payee>, &mut Vec<Vec<Credit>>, &mut u16),
+    tamper: impl FnOnce(&mut Hints, &mut Vec<Payee>, &mut Vec<Vec<Credit>>, &mut HeaderCounts),
 ) -> Result<(EthereumProof, lean_vm::cpu::Stats), AggregationError> {
     // Otherwise this reaches `cpu::prove`, which asserts rather than reporting.
     if !(lean_vm::pcs::MIN_LOG_INV_RATE..=lean_vm::pcs::MAX_LOG_INV_RATE).contains(&log_inv_rate) {
@@ -2728,8 +2777,9 @@ pub(crate) fn aggregate_tampered(
     }
     let n_sphincs = cover.sphincs_signers.len();
     let occurrences = occurrence_credits(&cover, children, payee);
-    let fold = fold_share(children.len(), cover.sphincs_signers.len());
-    let (mut payees, mut sphincs_credits) = plan_credits(&occurrences, &cover, payee, fold)?;
+    let claim_of: Vec<usize> = (0..n_sphincs).chain(cover.sphincs_links.iter().copied()).collect();
+    let fold = fold_share(children.len(), n_sphincs);
+    let (mut payees, mut sphincs_credits) = plan_credits(&occurrences, &claim_of, n_sphincs, payee, fold)?;
     let payee_index: BTreeMap<Payee, usize> = payees.iter().enumerate().map(|(i, p)| (*p, i)).collect();
     let group_cells = |group: &XmssClaimGroup| {
         [
@@ -2804,9 +2854,6 @@ pub(crate) fn aggregate_tampered(
     }
     push_absence_hints(&mut hints, &cover.sphincs_signers, &cover.sphincs_omitted);
     push_distinct_hints(&mut hints, &statements);
-    let claim_of: Vec<usize> = (0..cover.sphincs_signers.len())
-        .chain(cover.sphincs_links.iter().copied())
-        .collect();
     push_credit_set_hints(
         &mut hints,
         &occurrences,
@@ -2869,6 +2916,7 @@ pub(crate) fn aggregate_tampered(
         hints.push("child_defer", child.defer.cells());
         hints.push("child_da_count", vec![count(child.da_roots.len())]);
         hints.push("child_omitted", vec![count(child.sphincs_omitted.into())]);
+        hints.push("child_fold", vec![count(child.fold_share as usize)]);
         let (sub_hints, defer) = gen_verify(guest, pi, summary)?;
         for (name, entry) in sub_hints {
             hints.push(name, entry);
@@ -2958,13 +3006,21 @@ pub(crate) fn aggregate_tampered(
         hints.push("da_roots", da_claim_cells(root));
     }
 
-    let mut sphincs_omitted = u16::try_from(cover.sphincs_omitted.len()).expect("below MAX_KEYS");
-    tamper(&mut hints, &mut payees, &mut sphincs_credits, &mut sphincs_omitted);
+    let mut counts = HeaderCounts {
+        sphincs_omitted: u16::try_from(cover.sphincs_omitted.len()).expect("below MAX_KEYS"),
+        fold_share: fold.map_or(0, |f| u32::try_from(f).expect("below 2^21")),
+    };
+    tamper(&mut hints, &mut payees, &mut sphincs_credits, &mut counts);
+    let HeaderCounts {
+        sphincs_omitted,
+        fold_share,
+    } = counts;
     let public_input = statement_digest(
         signers_hash(cover.declared(), &cover.sphincs_signers),
         da_list_digest(&da_roots),
         credit_digest(&payees, &sphincs_credits),
         sphincs_omitted,
+        fold_share,
         &defer,
     );
     let mut program = guest.clone();
@@ -2982,6 +3038,7 @@ pub(crate) fn aggregate_tampered(
             payees,
             sphincs_credits,
             sphincs_omitted,
+            fold_share,
             defer,
             proof,
         },
@@ -5559,6 +5616,7 @@ def main():
         });
         // The node omits nothing; claiming it did, or the reverse, is a statement lie.
         tampered(&|s| s.sphincs_omitted = 1);
+        tampered(&|s| s.fold_share += 1);
         tampered(&|s| s.xmss_signers[0].keys[0] = get_signers(2 * SMALL_LEAF_SIZE + 1)[2 * SMALL_LEAF_SIZE].0.clone());
         // Splitting one group's keys across two epochs: the same claims cannot
         // be re-attributed to an epoch nothing signed at.
@@ -5607,7 +5665,7 @@ def main():
 
     type Tamper<'a> = (&'a str, &'a dyn Fn(&mut Hints));
     /// A hook that may also lie about the payee table and credits published.
-    type CreditHook<'a> = &'a dyn Fn(&mut Hints, &mut Vec<Payee>, &mut Vec<Vec<Credit>>, &mut u16);
+    type CreditHook<'a> = &'a dyn Fn(&mut Hints, &mut Vec<Payee>, &mut Vec<Vec<Credit>>, &mut HeaderCounts);
     type SlotHook<'a> = &'a dyn Fn(&mut Hints, &mut Vec<Payee>, &mut Vec<Vec<Credit>>);
 
     /// Corrupt each security-critical hint and require rejection.
@@ -5891,6 +5949,14 @@ def main():
             }),
             ("child_defer (a forged carried claim)", &|h: &mut Hints| {
                 h.entries("child_defer")[0][0] += F192::ONE;
+            }),
+            // Header counts the child did not publish: its statement no longer
+            // matches its proof.
+            ("child_omitted (omissions the child did not make)", &|h: &mut Hints| {
+                h.entries("child_omitted")[0] = vec![count(1)];
+            }),
+            ("child_fold (a share the child did not take)", &|h: &mut Hints| {
+                h.entries("child_fold")[0] = vec![count(1)];
             }),
             ("bc_star_hint", &|h: &mut Hints| {
                 h.entries("bc_star_hint")[0][0] += F192::ONE;
@@ -6511,8 +6577,40 @@ def main():
         assert_eq!(check(&over), malformed, "MAX_KEYS entries");
     }
 
+    /// `plan_credits` refuses what the guest could not prove: `MAX_KEYS` credits
+    /// read from the occurrences or more (the guest numbers them below it), and a
+    /// weight of 2^48 or more (the guest takes differences in three 16-bit limbs).
+    #[test]
+    fn plan_credits_stays_within_the_guest() {
+        let payees: Vec<Payee> = (1..=8u8).map(|i| [i; 20]).collect();
+        let own: Payee = [0xee; 20];
+        // Every claim published and linked once, each occurrence naming the eight
+        // payees: 16 credits read a claim, 9 entries published.
+        let plan = |n_sphincs: usize, short: usize| {
+            let row: Vec<(Payee, u64)> = payees.iter().map(|p| (*p, LEAF_WEIGHT)).collect();
+            let mut occurrences = vec![row; 2 * n_sphincs];
+            occurrences.last_mut().expect("occurrences").truncate(8 - short);
+            let claim_of: Vec<usize> = (0..n_sphincs).chain(0..n_sphincs).collect();
+            plan_credits(&occurrences, &claim_of, n_sphincs, own, fold_share(2, n_sphincs))
+        };
+        assert!(plan(MAX_KEYS / 16, 1).is_ok(), "MAX_KEYS - 1 credits read");
+        assert_eq!(
+            plan(MAX_KEYS / 16, 0).err(),
+            Some(AggregationError::TooLarge),
+            "MAX_KEYS credits read"
+        );
+        // This node's own weight, one below 2^48 before its share.
+        let own_weight = |fold: u64| plan_credits(&[vec![(own, (1 << 48) - 2)]], &[0], 1, own, Some(fold));
+        assert!(own_weight(1).is_ok(), "a weight of 2^48 - 1");
+        assert_eq!(
+            own_weight(2).err(),
+            Some(AggregationError::TooLarge),
+            "a weight of 2^48"
+        );
+    }
+
     /// The weighted-set checks alone (`own_credit_lists`, `credit_sets`,
-    /// `fold_contributions`, `credit_attained`), over sets and occurrences chosen
+    /// `credit_join`), over sets and occurrences chosen
     /// here, the occurrence sets laid end to end as a child's are: honest witnesses
     /// pass, and each lie is caught by the check it targets.
     #[test]
@@ -6589,7 +6687,8 @@ def main():
             base: &'a [(usize, u64)],
             top: &'a [usize],
             empty: &'a [usize],
-            gap: &'a [(usize, [F192; 2])],
+            nonempty: &'a [usize],
+            gap: &'a [(usize, [F192; 3])],
             pos: &'a [(usize, usize)],
         }
         let run = |sets: &Sets, occurrences: &Occurrences, fold: Option<u64>, lie: Lie| {
@@ -6654,18 +6753,21 @@ def main():
                     hints.push("credit_top", vec![count(1)]);
                 } else {
                     hints.push("credit_top", vec![count(0)]);
-                    let d = base[e].wrapping_sub(w) & 0xffff_ffff;
-                    let limbs = lie.gap.iter().find(|(g, _)| *g == id).map_or(
-                        vec![count((d & 0xffff) as usize), count((d >> 16) as usize)],
-                        |(_, l)| l.to_vec(),
-                    );
+                    // A lie's difference may be negative: the low limbs of its
+                    // wrapped value.
+                    let d = base[e].wrapping_sub(w) & ((1 << 48) - 1);
+                    let limbs = lie
+                        .gap
+                        .iter()
+                        .find(|(g, _)| *g == id)
+                        .map_or_else(|| gap_limbs(d).to_vec(), |(_, l)| l.to_vec());
                     hints.push("credit_gap", limbs);
                 }
             }
             for (j, set) in sets.iter().enumerate() {
                 if set.first().is_some_and(|&(p, _)| p == 0) {
                     let e = starts[j];
-                    let empty = first_top[e].is_none() || lie.empty.contains(&j);
+                    let empty = (first_top[e].is_none() && !lie.nonempty.contains(&j)) || lie.empty.contains(&j);
                     hints.push("credit_base", vec![count(base[e] as usize)]);
                     hints.push("credit_empty", vec![count(usize::from(empty))]);
                 }
@@ -6685,6 +6787,7 @@ def main():
             base: &[],
             top: &[],
             empty: &[],
+            nonempty: &[],
             gap: &[],
             pos: &[],
         };
@@ -6717,10 +6820,12 @@ def main():
             None,
             "a weight that is not its base"
         );
+        // Claimed not empty, so only the count finds the entry without a top.
         let above = Lie {
             base: &[(0, 6)],
             top: &[],
             empty: &[],
+            nonempty: &[0],
             gap: &[],
             pos: &[],
         };
@@ -6729,11 +6834,12 @@ def main():
             None,
             "a maximum above every contribution"
         );
-        // Below a contribution: 5 does not fit under 4 in two 16-bit limbs.
+        // Below a contribution: 5 does not fit under 4 in three 16-bit limbs.
         let below = Lie {
             base: &[(0, 4)],
             top: &[],
             empty: &[],
+            nonempty: &[],
             gap: &[],
             pos: &[],
         };
@@ -6742,14 +6848,15 @@ def main():
             None,
             "a maximum below a contribution"
         );
-        // The same, with the difference -1 written as a limb: g^-1 low, or g^(-2^48)
-        // high (its 2^16-th power is g^-1). Only the limbs' bounds keep a
-        // difference non-negative.
+        // The same, with the difference -1 written as a limb: g^-1 low, g^(-2^48) in
+        // the middle (its 2^16-th power is g^-1), or g^(-2^32) high (its 2^32-th
+        // power is). Only the limbs' bounds keep a difference non-negative.
         let low = Lie {
             base: &[(0, 4)],
             top: &[],
             empty: &[],
-            gap: &[(0, [F192::from(G.inv()), F192::ONE])],
+            nonempty: &[],
+            gap: &[(0, [F192::from(G.inv()), F192::ONE, F192::ONE])],
             pos: &[],
         };
         assert_eq!(
@@ -6757,11 +6864,25 @@ def main():
             None,
             "a negative difference in the low limb"
         );
+        let middle = Lie {
+            base: &[(0, 4)],
+            top: &[],
+            empty: &[],
+            nonempty: &[],
+            gap: &[(0, [F192::ONE, F192::from(f64_pow(G, u64::MAX - (1 << 48))), F192::ONE])],
+            pos: &[],
+        };
+        assert_eq!(
+            run(&vec![vec![(0, 4), (2, 3)], vec![(1, 7)]], &occurrences(), None, middle),
+            None,
+            "a negative difference in the middle limb"
+        );
         let high = Lie {
             base: &[(0, 4)],
             top: &[],
             empty: &[],
-            gap: &[(0, [F192::ONE, F192::from(f64_pow(G, u64::MAX - (1 << 48)))])],
+            nonempty: &[],
+            gap: &[(0, [F192::ONE, F192::ONE, F192::from(f64_pow(G, u64::MAX - (1 << 32)))])],
             pos: &[],
         };
         assert_eq!(
@@ -6769,6 +6890,22 @@ def main():
             None,
             "a negative difference in the high limb"
         );
+        // Differences across the limbs, up to the largest two weights below 2^48
+        // can have: payee 0 reaches claim 0 with the most a weight can be, and
+        // again with less.
+        let top_weight = (1u64 << 48) - 1;
+        for d in [(1 << 16) - 1, 1 << 16, (1 << 32) - 1, 1 << 32, top_weight - 1] {
+            let wide: Occurrences = vec![
+                (0, vec![(0, top_weight)]),
+                (1, vec![(1, 7)]),
+                (0, vec![(0, top_weight - d)]),
+            ];
+            assert_eq!(
+                run(&vec![vec![(0, top_weight)], vec![(1, 7)]], &wide, None, honest()),
+                Some(true),
+                "a difference of {d}"
+            );
+        }
         // A lone verifier renamed in a larger set: claim 0's single-payee occurrences
         // name payees 0 and 3, and payee 0 is published as payee 2.
         let singles = || -> Occurrences { vec![(0, vec![(0, 5)]), (0, vec![(3, 4)]), (1, vec![(1, 7)])] };
@@ -6787,6 +6924,7 @@ def main():
             base: &[],
             top: &[],
             empty: &[],
+            nonempty: &[],
             gap: &[],
             pos: &[],
         };
@@ -6803,6 +6941,7 @@ def main():
             base: &[(1, 100)],
             top: &[3],
             empty: &[],
+            nonempty: &[],
             gap: &[],
             pos: &[],
         };
@@ -6823,6 +6962,7 @@ def main():
             base: &[],
             top: &[],
             empty: &[0],
+            nonempty: &[],
             gap: &[],
             pos: &[],
         };
@@ -6836,6 +6976,7 @@ def main():
             base: &[(0, 9)],
             top: &[],
             empty: &[0],
+            nonempty: &[],
             gap: &[],
             pos: &[],
         };
@@ -6916,6 +7057,7 @@ def main():
             base: &[],
             top: &[],
             empty: &[],
+            nonempty: &[],
             gap: &[],
             pos: &[(0, 1)],
         };
@@ -6937,6 +7079,7 @@ def main():
             base: &[],
             top: &[],
             empty: &[],
+            nonempty: &[],
             gap: &[],
             pos: &[(1, 0)],
         };
@@ -7153,8 +7296,10 @@ def main():
         );
         // Sets and weights survive the wire.
         let node = fold(&[a.clone(), b.clone(), c.clone()]);
+        assert_eq!(u64::from(node.fold_share()), share(3, 3));
         let back = EthereumProof::from_bytes(&node.to_bytes()).expect("decodes");
         assert_eq!(back.sphincs_credits, node.sphincs_credits);
+        assert_eq!(back.fold_share(), node.fold_share());
         back.verify().expect("the decoded aggregate verifies");
         // Raw against a child, one child: no merge, so no share.
         let node = aggregate(
@@ -7168,6 +7313,7 @@ def main():
         )
         .expect("node aggregates");
         node.verify().expect("node verifies");
+        assert_eq!(node.fold_share(), 0);
         assert_eq!(
             weighed(&node),
             expect(&[(0, &[(PAYEE, L), (A, L)]), (1, &[(A, L)]), (2, &[(A, L)])])
@@ -7198,6 +7344,25 @@ def main():
         let (honest, _, sets) = outcome(None, vec![], &|_, _, _| {}).expect("proves");
         assert!(honest);
         assert_eq!(sets, honest_sets);
+        // The share published apart from the weights it went into, and bound.
+        for (lie, fold) in [(0, f), (1, f + 1), (-1, f - 1)] {
+            let outcome = aggregate_tampered(
+                &children,
+                vec![],
+                vec![],
+                None,
+                DaInput::default(),
+                PAYEE,
+                LOG_INV_RATE,
+                |_, _, _, counts| counts.fold_share = u32::try_from(fold).expect("small"),
+            )
+            .map(|(proof, _)| (proof.verify().is_ok(), u64::from(proof.fold_share())));
+            if lie == 0 {
+                assert_eq!(outcome, Ok((true, f)), "the share published");
+            } else {
+                assert!(!matches!(outcome, Ok((true, _))), "a fold share off by {lie}");
+            }
+        }
         type SetEdit<'a> = &'a dyn Fn(&mut Vec<Vec<Credit>>, u16, u16);
         let lie = |h: &mut Hints, p: &mut Vec<Payee>, c: &mut Vec<Vec<Credit>>, edit: SetEdit| {
             let old = c.clone();
@@ -7440,7 +7605,7 @@ def main():
                 DaInput::default(),
                 PAYEE,
                 LOG_INV_RATE,
-                |h, _, _, omitted| tamper(h, omitted),
+                |h, _, _, counts| tamper(h, &mut counts.sphincs_omitted),
             )
             .map(|(proof, _)| (proof.verify().is_ok(), proof.sphincs_omitted()))
         };
